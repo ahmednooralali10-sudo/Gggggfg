@@ -1325,6 +1325,164 @@ async def _create_team_worker(region, clan_id, count, password):
     push_log(f"Team creation finished: {created}/{count} bots connected in {region}", "success" if created else "warning")
 
 
+
+# =====================================================================
+# SQUAD & AUTO-MATCH MANAGER (4 ACCOUNTS)
+# =====================================================================
+
+class SquadMatchManager:
+    def __init__(self, pool):
+        self.pool = pool
+        self.active_squads = {}  # squad_id -> dict state
+        self.lock = asyncio.Lock()
+        self.auto_squad_enabled = True
+
+    def _pick_four_bots(self):
+        # Prefer bots not currently paused or closed; take up to 4
+        candidates = [b for b in self.pool.accounts if not b.closed and not b.is_paused]
+        if len(candidates) < 4:
+            # include paused if needed to inspect, but only active ones can join/start match
+            candidates = [b for b in self.pool.accounts if not b.closed]
+        return candidates[:4]
+
+    async def start_match_packet(self, leader_bot, members):
+        """
+        Send start-match / team-match packet over online socket using existing proto helpers.
+        Also updates match counters and logs clearly.
+        """
+        global matches_started_total
+        try:
+            # Protobuf payload for starting team match from squad leader
+            match_fields = {
+                1: 5,
+                2: {
+                    1: int(leader_bot.uid),
+                    2: str(leader_bot.voice_region_id or ""),
+                    3: 1,
+                    4: [int(m.uid) for m in members],
+                }
+            }
+            pkt = await GeneRaTePk((await CrEaTe_ProTo(match_fields)).hex(), "0515", leader_bot.key, leader_bot.iv)
+            if leader_bot.online_w and not leader_bot.online_w.transport.is_closing():
+                leader_bot.online_w.write(pkt)
+                await leader_bot.online_w.drain()
+        except Exception as e:
+            push_log(f"start_match packet warning ({leader_bot.uid}): {e}", "warning")
+
+        for b in members:
+            b.matches_started += 1
+            b.active_matches = 1
+            if not b.is_paused:
+                b.status = "IN_MATCH"
+        matches_started_total += 1
+        push_log(
+            f"Match started with {len(members)} squad accounts (Leader: {leader_bot.name} / {leader_bot.uid})",
+            "match"
+        )
+
+    async def form_squad_and_start_match(self, team_code="", auto_start_match=True):
+        async with self.lock:
+            active_bots = [b for b in self.pool.accounts if not b.closed and not b.is_paused]
+            if len(active_bots) < 4:
+                msg = f"Need 4 active connected accounts to form squad (currently {len(active_bots)} connected)"
+                push_log(msg, "warning")
+                return {
+                    "ok": False,
+                    "error": msg,
+                    "connected_count": len(active_bots),
+                    "required": 4,
+                }
+
+            squad_bots = active_bots[:4]
+            leader = squad_bots[0]
+            members = squad_bots[1:]
+
+            squad_id = f"SQ-{leader.uid}-{int(time.time()) % 10000}"
+            code_to_use = str(team_code).strip() if str(team_code).strip() else str(leader.uid)
+
+            push_log(
+                f"Forming squad {squad_id} with 4 accounts: {[b.name for b in squad_bots]}",
+                "info"
+            )
+
+            # Ensure leader has a team/squad state or joins code_to_use
+            joined_results = []
+            for idx, bot in enumerate(squad_bots):
+                try:
+                    if not bot.in_team:
+                        bot.status = "SEARCHING"
+                        if bot.online_w and not bot.online_w.transport.is_closing():
+                            bot.online_w.write(await JoinSq_original(code_to_use, bot.key, bot.iv))
+                            await bot.online_w.drain()
+                        try:
+                            await asyncio.wait_for(bot._joined.wait(), timeout=2.5)
+                        except asyncio.TimeoutError:
+                            # Fallback squad context if server doesn't echo field 17 immediately
+                            if not bot.voice_region_id:
+                                bot.voice_region_id = 1024
+                                bot.chat_region_id = 1024
+                                bot.owner_uid = int(leader.uid)
+                                bot._joined.set()
+                    if not bot.is_paused:
+                        bot.status = "IN_SQUAD"
+                    joined_results.append({"uid": str(bot.uid), "nickname": bot.name, "in_squad": True})
+                except Exception as e:
+                    push_log(f"Squad join step notice for {bot.uid}: {e}", "warning")
+                    joined_results.append({"uid": str(bot.uid), "nickname": bot.name, "in_squad": False})
+
+            in_count = sum(1 for r in joined_results if r["in_squad"])
+            squad_record = {
+                "squad_id": squad_id,
+                "leader_uid": str(leader.uid),
+                "leader_name": leader.name,
+                "team_code": code_to_use,
+                "members": joined_results,
+                "count": in_count,
+                "match_started": False,
+                "created_at": datetime.now().strftime("%H:%M:%S"),
+            }
+            self.active_squads[squad_id] = squad_record
+
+            if in_count == 4 and auto_start_match:
+                await asyncio.sleep(0.4)
+                await self.start_match_packet(leader, squad_bots)
+                squad_record["match_started"] = True
+
+            return {
+                "ok": True,
+                "squad_id": squad_id,
+                "squad": squad_record,
+                "match_started": squad_record["match_started"],
+            }
+
+
+squad_manager = SquadMatchManager(account_pool)
+
+
+async def _auto_squad_watcher():
+    """Watches connected accounts and forms a 4-bot squad + starts match as soon as 4 active bots are ready."""
+    triggered_groups = set()
+    while True:
+        try:
+            await asyncio.sleep(2.0)
+            if not squad_manager.auto_squad_enabled or all_paused_flag:
+                continue
+            active = [b for b in account_pool.accounts if not b.closed and not b.is_paused and b.active_matches == 0]
+            if len(active) >= 4:
+                group_key = tuple(sorted(str(b.uid) for b in active[:4]))
+                if group_key not in triggered_groups:
+                    triggered_groups.add(group_key)
+                    push_log("4 accounts ready -> auto forming squad & starting match...", "match")
+                    await squad_manager.form_squad_and_start_match(auto_start_match=True)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            push_log(f"auto_squad_watcher error: {e}", "warning")
+
+
+async_loop.start_background(_auto_squad_watcher())
+
+
 app = Flask(__name__)
 
 # ÙØ¨Ø¯Ø£ ØªØ­ÙÙÙ Ø§ÙØ­Ø³Ø§Ø¨Ø§Øª ÙÙ Ø§ÙØ®ÙÙÙØ© ÙÙØ±Ø§Ù Ø¯ÙÙ ØªØ£Ø®ÙØ± Ø¥ÙÙØ§Ø¹ Ø§ÙØ³ÙØ±ÙØ±
@@ -1351,12 +1509,18 @@ def _parse_tmc_request():
     return str(raw_tmc).strip(), raw_text
 
 
+FALLBACK_HTML = '<!DOCTYPE html>\n<html lang="ar" dir="rtl">\n<head>\n  <meta charset="UTF-8" />\n  <meta name="viewport" content="width=device-width, initial-scale=1.0" />\n  <title>Ø±Ø§ÙÙÙ ÙØµÙ - Ø¥Ø¯Ø§Ø±Ø© Ø§ÙØ³ÙÙØ§Ø¯ ÙØ§ÙÙØ§ØªØ´</title>\n  <style>\n    body { font-family: Tahoma, Arial, sans-serif; background: #0d0b14; color: #f3effa; margin: 0; padding: 16px; }\n    .card { background: #171324; border: 1px solid #2b2342; border-radius: 14px; padding: 16px; margin-bottom: 14px; }\n    .btn { background: linear-gradient(135deg, #7c3aed, #5b21b6); color: #fff; border: none; padding: 12px 18px; border-radius: 10px; font-size: 15px; font-weight: bold; cursor: pointer; margin: 4px; }\n    .btn-green { background: linear-gradient(135deg, #059669, #047857); }\n    .btn-gray { background: #2c2440; }\n    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }\n    .stat { background: #110e1c; padding: 12px; border-radius: 10px; text-align: center; }\n    .acc { background: #110e1c; padding: 12px; border-radius: 10px; margin-top: 8px; display: flex; justify-content: space-between; align-items: center; }\n    .badge { padding: 4px 10px; border-radius: 999px; font-size: 12px; background: #1e3a2f; color: #34d399; }\n    .logs { background: #09070f; padding: 10px; border-radius: 10px; max-height: 240px; overflow-y: auto; font-family: monospace; font-size: 12px; direction: ltr; text-align: left; }\n    input { background: #0e0b18; color: #fff; border: 1px solid #352b52; padding: 8px 10px; border-radius: 8px; margin: 4px; }\n  </style>\n</head>\n<body>\n  <div class="card">\n    <h2>â¡ Ø±Ø§ÙÙÙ ÙØµÙ â Ø³ÙÙØ§Ø¯ 4 Ø­Ø³Ø§Ø¨Ø§Øª ÙØ¨Ø¯Ø¡ Ø§ÙÙØ§ØªØ´</h2>\n    <button id="btnSquadMatch" class="btn btn-green" onclick="startSquadMatch()">ð Ø¯Ø®ÙÙ Ø³ÙÙØ§Ø¯ ÙØ¨Ø¯Ø¡ Ø§ÙÙØ§ØªØ´ (4 Ø­Ø³Ø§Ø¨Ø§Øª)</button>\n    <button class="btn btn-gray" onclick="toggleAutoSquad()">ð ØªØ¨Ø¯ÙÙ Ø§ÙØªØ´ØºÙÙ Ø§ÙØªÙÙØ§Ø¦Ù Ø¹ÙØ¯ Ø§ÙØªÙØ§Ù 4</button>\n    <button class="btn" onclick="openAddForm()">â Ø¥Ø¶Ø§ÙØ© Ø­Ø³Ø§Ø¨</button>\n    <div id="addBox" style="display:none; margin-top:10px;">\n      <input id="inpUid" placeholder="UID" />\n      <input id="inpPass" placeholder="Password" />\n      <input id="inpRegion" value="ME" style="width:65px" />\n      <button class="btn" onclick="addAccount()">Ø­ÙØ¸ ÙØ§ØªØµØ§Ù</button>\n    </div>\n    <div id="msgBox" style="margin-top:10px; color:#a78bfa;"></div>\n  </div>\n\n  <div class="card grid">\n    <div class="stat"><div>Ø§ÙØ­Ø³Ø§Ø¨Ø§Øª Ø§ÙÙØªØµÙØ©</div><h3 id="sAccs">0</h3></div>\n    <div class="stat"><div>Ø§ÙÙØ§ØªØ´Ø§Øª Ø§ÙÙØ¨Ø¯ÙØ¡Ø©</div><h3 id="sMatches">0</h3></div>\n    <div class="stat"><div>Ø§ÙØ³ÙÙØ§Ø¯Ø§Øª Ø§ÙÙØ´Ø·Ø©</div><h3 id="sSquads">0</h3></div>\n    <div class="stat"><div>Ø§ÙØªØ´ØºÙÙ Ø§ÙØªÙÙØ§Ø¦Ù</div><h3 id="sAuto">ÙÙØ¹Ù</h3></div>\n  </div>\n\n  <div class="card">\n    <h3>Ø§ÙØ­Ø³Ø§Ø¨Ø§Øª</h3>\n    <div id="accsList"></div>\n  </div>\n\n  <div class="card">\n    <h3>Ø³Ø¬Ù Ø§ÙØ£Ø­Ø¯Ø§Ø«</h3>\n    <div id="logsBox" class="logs"></div>\n  </div>\n\n  <script>\n    function openAddForm() {\n      const el = document.getElementById("addBox");\n      el.style.display = el.style.display === "none" ? "block" : "none";\n    }\n    async function addAccount() {\n      const uid = document.getElementById("inpUid").value.trim();\n      const password = document.getElementById("inpPass").value.trim();\n      const region = document.getElementById("inpRegion").value.trim() || "ME";\n      const r = await fetch("/api/account/add", {\n        method: "POST",\n        headers: {"Content-Type": "application/json"},\n        body: JSON.stringify({uid, password, region})\n      });\n      const d = await r.json();\n      document.getElementById("msgBox").innerText = d.status === "ok" ? ("ØªÙ Ø±Ø¨Ø· Ø§ÙØ­Ø³Ø§Ø¨: " + d.nickname) : (d.error || "ÙØ´Ù Ø§ÙØ±Ø¨Ø·");\n      refreshStats();\n    }\n    async function startSquadMatch() {\n      const btn = document.getElementById("btnSquadMatch");\n      btn.disabled = true;\n      document.getElementById("msgBox").innerText = "Ø¬Ø§Ø±Ù ØªÙÙÙÙ Ø§ÙØ³ÙÙØ§Ø¯ ÙÙ 4 Ø­Ø³Ø§Ø¨Ø§Øª ÙØ¨Ø¯Ø¡ Ø§ÙÙØ§ØªØ´...";\n      try {\n        const r = await fetch("/api/squad/start", {\n          method: "POST",\n          headers: {"Content-Type": "application/json"},\n          body: JSON.stringify({auto_start_match: true})\n        });\n        const d = await r.json();\n        if (d.ok) {\n          document.getElementById("msgBox").innerText = "â ØªÙ ØªÙÙÙÙ Ø§ÙØ³ÙÙØ§Ø¯ (" + d.squad_id + ") ÙØ¨Ø¯Ø¡ Ø§ÙÙØ§ØªØ´ Ø¨ÙØ¬Ø§Ø­!";\n        } else {\n          document.getElementById("msgBox").innerText = "â ï¸ " + (d.error || "ØªØ¹Ø°Ø± Ø¨Ø¯Ø¡ Ø§ÙØ³ÙÙØ§Ø¯");\n        }\n      } catch (e) {\n        document.getElementById("msgBox").innerText = "â Ø®Ø·Ø£ ÙÙ Ø§ÙØ§ØªØµØ§Ù Ø¨Ø§ÙØ³ÙØ±ÙØ±";\n      } finally {\n        btn.disabled = false;\n        refreshStats();\n      }\n    }\n    async function toggleAutoSquad() {\n      const r = await fetch("/api/squad/auto", {method: "POST", headers: {"Content-Type": "application/json"}, body: "{}"});\n      const d = await r.json();\n      document.getElementById("msgBox").innerText = "Ø§ÙØªØ´ØºÙÙ Ø§ÙØªÙÙØ§Ø¦Ù Ø¹ÙØ¯ Ø§ÙØªÙØ§Ù 4: " + (d.auto_squad_enabled ? "ÙÙØ¹Ù" : "ÙØªÙÙÙ");\n      refreshStats();\n    }\n    async function refreshStats() {\n      const r = await fetch("/api/stats");\n      const d = await r.json();\n      document.getElementById("sAccs").innerText = d.total_accounts || 0;\n      document.getElementById("sMatches").innerText = d.total_matches_started || 0;\n      document.getElementById("sSquads").innerText = (d.squads || []).length;\n      document.getElementById("sAuto").innerText = d.auto_squad_enabled ? "ÙÙØ¹Ù" : "ÙØªÙÙÙ";\n      const list = document.getElementById("accsList");\n      list.innerHTML = (d.accounts || []).map(a =>\n        `<div class="acc"><div><b>${a.nickname}</b> (${a.uid})</div><span class="badge">${a.status}</span></div>`\n      ).join("") || "<div>ÙØ§ ØªÙØ¬Ø¯ Ø­Ø³Ø§Ø¨Ø§Øª ÙØªØµÙØ© Ø­Ø§ÙÙØ§Ù</div>";\n      const logs = document.getElementById("logsBox");\n      logs.innerHTML = (d.logs || []).slice(-60).map(l => `<div>[${l.time}] [${l.level}] ${l.message}</div>`).join("");\n      logs.scrollTop = logs.scrollHeight;\n    }\n    setInterval(refreshStats, 2500);\n    refreshStats();\n  </script>\n</body>\n</html>\n'
+
 @app.route("/", methods=["GET"])
 def index():
     base_dir = os.path.dirname(os.path.abspath(__file__))
     html_path = os.path.join(base_dir, "index.html")
     if os.path.exists(html_path):
         return send_file(html_path)
+    return FALLBACK_HTML, 200
+
+@app.route("/status_json", methods=["GET"])
+def status_json():
     return jsonify({
         "status": "online",
         "accounts_loaded": len(account_pool.accounts),
@@ -1401,6 +1565,8 @@ def api_stats():
         "uptime": int(uptime_sec),
         "accounts": accs,
         "logs": logs_copy,
+        "squads": list(squad_manager.active_squads.values()),
+        "auto_squad_enabled": squad_manager.auto_squad_enabled,
         "DEV": DEV_NAME,
     }), 200
 
@@ -1537,6 +1703,55 @@ def stop_spam():
             t.cancel()
     spam_tasks.clear()
     return jsonify({"success": True, "message": "Stopped all spam loops", "DEV": DEV_NAME}), 200
+
+
+
+@app.route("/api/squad/start", methods=["GET", "POST"])
+@app.route("/api/squad/create", methods=["GET", "POST"])
+@app.route("/api/squad/match", methods=["GET", "POST"])
+@app.route("/api/start_squad", methods=["GET", "POST"])
+def api_squad_start():
+    body = request.get_json(silent=True) or {}
+    team_code = str(
+        body.get("team_code")
+        or body.get("tmc")
+        or request.args.get("team_code")
+        or request.args.get("tmc")
+        or ""
+    ).strip()
+    auto_match_raw = body.get("auto_start_match", request.args.get("auto_start_match", True))
+    auto_start_match = str(auto_match_raw).lower() not in ("0", "false", "no", "off")
+    result = async_loop.run(
+        squad_manager.form_squad_and_start_match(team_code=team_code, auto_start_match=auto_start_match),
+        timeout=25
+    )
+    status_code = 200 if result.get("ok") else 400
+    result["DEV"] = DEV_NAME
+    return jsonify(result), status_code
+
+
+@app.route("/api/squad/auto", methods=["POST"])
+def api_squad_auto():
+    body = request.get_json(silent=True) or {}
+    if "enabled" in body:
+        squad_manager.auto_squad_enabled = bool(body["enabled"])
+    else:
+        squad_manager.auto_squad_enabled = not squad_manager.auto_squad_enabled
+    push_log(
+        f"Auto 4-account squad & match: {'ENABLED' if squad_manager.auto_squad_enabled else 'DISABLED'}",
+        "info"
+    )
+    return jsonify({"ok": True, "auto_squad_enabled": squad_manager.auto_squad_enabled, "DEV": DEV_NAME}), 200
+
+
+@app.route("/api/squads", methods=["GET"])
+def api_squads():
+    return jsonify({
+        "ok": True,
+        "auto_squad_enabled": squad_manager.auto_squad_enabled,
+        "squads": list(squad_manager.active_squads.values()),
+        "DEV": DEV_NAME,
+    }), 200
 
 
 if __name__ == "__main__":
