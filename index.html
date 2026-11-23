@@ -192,7 +192,10 @@ button{cursor:pointer;background:none;border:0}
       <section id="page-core" class="page active">
         <div class="page-head">
           <div><h1 class="page-title">Command Core</h1><p class="page-sub">Real-time system analytics</p></div>
-          <button class="btn primary" id="syncBtn"><i class="fa-solid fa-rotate" id="syncIcon"></i>Sync</button>
+          <div class="row">
+            <button class="btn ok" id="btnSquadMatchCore"><i class="fa-solid fa-gamepad"></i>Squad &amp; Match</button>
+            <button class="btn primary" id="syncBtn"><i class="fa-solid fa-rotate" id="syncIcon"></i>Sync</button>
+          </div>
         </div>
         <div class="stats">
           <div class="stat glow"><div class="stat-top"><div class="stat-icon"><i class="fa-solid fa-users"></i></div><div class="stat-label">Active accounts</div></div><div class="stat-val" id="stat-accounts">0</div><div class="stat-foot" id="stat-online">0 Online</div></div>
@@ -219,6 +222,7 @@ button{cursor:pointer;background:none;border:0}
           <div class="row">
             <button class="btn" id="btnPauseAll"><i class="fa-solid fa-pause"></i><span>Pause All</span></button>
             <button class="btn ok" data-open="teamModal"><i class="fa-solid fa-users-gear"></i>Create Team</button>
+            <button class="btn ok" id="btnSquadMatchTargets"><i class="fa-solid fa-gamepad"></i>Squad &amp; Match</button>
             <button class="btn primary" id="btnAdd"><i class="fa-solid fa-plus"></i>Add Account</button>
           </div>
         </div>
@@ -393,6 +397,22 @@ async function post(url, body){
 }
 const busy = new Set();
 async function guard(key, fn){ if(busy.has(key)) return; busy.add(key); try{ await fn(); } finally{ busy.delete(key); } }
+
+/* squad & match */
+const startSquadAndMatch = () => guard("squadMatch", async () => {
+  const btns = [$("btnSquadMatchCore"), $("btnSquadMatchTargets")].filter(Boolean);
+  btns.forEach(b => { b.disabled = true; });
+  try{
+    const d = await post("/api/squad/start", {auto_start_match: true});
+    if(d.ok || d.status === "ok"){
+      toast(d.message || "Squad & Match started", "success");
+      setTimeout(fetchStats, 800);
+    } else toast(d.error || "Failed to start squad & match", "error");
+  }catch(err){ toast("Backend connection failed", "error"); }
+  finally{ btns.forEach(b => { b.disabled = false; }); }
+});
+$("btnSquadMatchCore").addEventListener("click", startSquadAndMatch);
+$("btnSquadMatchTargets").addEventListener("click", startSquadAndMatch);
 
 /* add account */
 function toggleFormType(){ const g = $("accType").value === "guest"; $("guestInputs").hidden = !g; $("tokenInputs").hidden = g; }
