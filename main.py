@@ -4,11 +4,12 @@ import sys
 import json
 import time
 import uuid
-import random
+import socket
 import struct
 import asyncio
 import logging
 import threading
+import itertools
 from datetime import datetime
 from urllib.parse import unquote
 
@@ -19,6 +20,14 @@ from protobuf_decoder.protobuf_decoder import Parser
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
 from Pb2 import MajoRLoGinrEs_pb2, MajoRLoGinrEq_pb2, PorTs_pb2
+try:
+    import thunderFF_pb2
+except Exception:
+    thunderFF_pb2 = None
+try:
+    from message_ids import MESSAGE_ID_TO_NAME
+except Exception:
+    MESSAGE_ID_TO_NAME = {}
 
 DEV_NAME = "JAGWAR x STRAVEX"
 START_TIME = time.time()
@@ -28,6 +37,530 @@ log = logging.getLogger("jagwar")
 
 AES_KEY = b'Yg&tc%DEuh6%Zc^8'
 AES_IV = b'6oyZDr22E3ychjM%'
+
+# Level-Up / Solo Match configuration & constants extracted from Level-Up code
+START_MATCH_INTERVAL = 3.0
+NEW_MATCH_DELAY = 3.0
+MAX_MATCH_DURATION = 700
+MATCH_IDLE_TIMEOUT = 8.0
+PRIORITY_REGIONS = ["BD", "IND", "SG", "TH", "PH", "VN", "MY", "ID", "HK", "TW"]
+MAX_CONSECUTIVE_PARSE_FAILURES = 5.0
+NON_MATCH_RECONNECT_DELAY = 1.0
+
+CRC7_TABLE = bytes([
+    0, 9, 18, 27, 36, 45, 54, 63, 72, 65, 90, 83, 108, 101, 126, 119,
+    25, 16, 11, 2, 61, 52, 47, 38, 81, 88, 67, 74, 117, 124, 103, 110,
+    50, 59, 32, 41, 22, 31, 4, 13, 122, 115, 104, 97, 94, 87, 76, 69,
+    43, 34, 57, 48, 15, 6, 29, 20, 99, 106, 113, 120, 71, 78, 85, 92,
+    100, 109, 118, 127, 64, 73, 82, 91, 44, 37, 62, 55, 8, 1, 26, 19,
+    125, 116, 111, 102, 89, 80, 75, 66, 53, 60, 39, 46, 17, 24, 3, 10,
+    86, 95, 68, 77, 114, 123, 96, 105, 30, 23, 12, 5, 58, 51, 40, 33,
+    79, 70, 93, 84, 107, 98, 121, 112, 7, 14, 21, 28, 35, 42, 49, 56,
+    65, 72, 83, 90, 101, 108, 119, 126, 9, 0, 27, 18, 45, 36, 63, 54,
+    88, 81, 74, 67, 124, 117, 110, 103, 16, 25, 2, 11, 52, 61, 38, 47,
+    115, 122, 97, 104, 87, 94, 69, 76, 59, 50, 41, 32, 31, 22, 13, 4,
+    106, 99, 120, 113, 78, 71, 92, 85, 34, 43, 48, 57, 6, 15, 20, 29,
+    37, 44, 55, 62, 1, 8, 19, 26, 109, 100, 127, 118, 73, 64, 91, 82,
+    60, 53, 46, 39, 24, 17, 10, 3, 116, 125, 102, 111, 80, 89, 66, 75,
+    23, 30, 5, 12, 51, 58, 33, 40, 95, 86, 77, 68, 123, 114, 105, 96,
+    14, 7, 28, 21, 42, 35, 56, 49, 70, 79, 84, 93, 98, 107, 112, 121,
+])
+
+_DELTA = 0x9E3779B9
+_ROUNDS = 16
+_FIELD_SIZES = {0: 1, 1: 2, 2: 2, 3: 1, 4: 2}
+_FIELD_NAMES = {0: "sendOption", 1: "cmd", 2: "orderId", 3: "flags", 4: "length"}
+
+# ==================== CLOUDFLARE DNS & SOCKET OPTIMIZERS (FROM LEVEL-UP) ====================
+CLOUDFLARE_PRIMARY_DNS = "1.1.1.1"
+CLOUDFLARE_SECONDARY_DNS = "1.0.0.1"
+_DNS_CACHE = {}
+_DNS_CACHE_TTL = 300.0
+
+
+async def resolve_host_cloudflare(hostname: str) -> str:
+    if not hostname:
+        return hostname
+    parts = hostname.split('.')
+    if len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
+        return hostname
+    now = time.time()
+    if hostname in _DNS_CACHE:
+        ip, exp = _DNS_CACHE[hostname]
+        if now < exp:
+            return ip
+
+    def _query_cloudflare(server_ip: str):
+        s = None
+        try:
+            tx_id = random.randint(1000, 65535)
+            header = struct.pack(">HHHHHH", tx_id, 0x0100, 1, 0, 0, 0)
+            qname = b"".join(bytes([len(part)]) + part.encode('ascii') for part in hostname.split('.')) + b"\x00"
+            query_pkt = header + qname + struct.pack(">HH", 1, 1)
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(1.2)
+            s.sendto(query_pkt, (server_ip, 53))
+            resp, _ = s.recvfrom(1024)
+            if len(resp) >= 12:
+                ancount = struct.unpack(">H", resp[6:8])[0]
+                if ancount > 0:
+                    offset = 12 + len(qname) + 4
+                    for _ in range(ancount):
+                        if offset >= len(resp):
+                            break
+                        if (resp[offset] & 0xC0) == 0xC0:
+                            offset += 2
+                        else:
+                            while offset < len(resp) and resp[offset] != 0:
+                                offset += 1 + resp[offset]
+                            offset += 1
+                        if offset + 10 > len(resp):
+                            break
+                        rtype, rclass, ttl, rdlen = struct.unpack(">HHIH", resp[offset:offset+10])
+                        offset += 10
+                        if rtype == 1 and rdlen == 4 and offset + 4 <= len(resp):
+                            return socket.inet_ntoa(resp[offset:offset+4])
+                        offset += rdlen
+        except Exception:
+            pass
+        finally:
+            if s:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+        return None
+
+    loop = asyncio.get_running_loop()
+    ip = await loop.run_in_executor(None, _query_cloudflare, CLOUDFLARE_PRIMARY_DNS)
+    if not ip:
+        ip = await loop.run_in_executor(None, _query_cloudflare, CLOUDFLARE_SECONDARY_DNS)
+    if not ip:
+        try:
+            ip_info = await loop.getaddrinfo(hostname, None, family=socket.AF_INET)
+            if ip_info:
+                ip = ip_info[0][4][0]
+        except Exception:
+            ip = hostname
+    if ip:
+        _DNS_CACHE[hostname] = (ip, now + _DNS_CACHE_TTL)
+    return ip or hostname
+
+
+def optimize_tcp_socket(sock: socket.socket):
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+    except Exception:
+        pass
+
+
+def optimize_udp_socket(sock: socket.socket):
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 131072)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 131072)
+        if hasattr(socket, 'SIO_UDP_CONNRESET') and os.name == 'nt':
+            try:
+                sock.ioctl(socket.SIO_UDP_CONNRESET, False)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+# ==================== LEVEL-UP UDP / TEA / PROTOBUF MATCH HELPERS ====================
+async def has_ssan_zig(n):
+    z = (n << 1) & 0xFFFFFFFFFFFFFFFF
+    out = bytearray()
+    while z >= 0x80:
+        out.append((z & 0x7F) | 0x80)
+        z >>= 7
+    out.append(z)
+    return bytes(out)
+
+
+async def uleb_encode(n):
+    out = bytearray()
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        if n:
+            b |= 0x80
+        out.append(b)
+        if not n:
+            break
+    return bytes(out)
+
+
+async def tea_enc(v0, v1, k0, k1, k2, k3):
+    s = 0
+    for _ in range(_ROUNDS):
+        s = (s + _DELTA) & 0xFFFFFFFF
+        v0 = (v0 + (((((v1 << 4) & 0xFFFFFFFF) + k0) & 0xFFFFFFFF ^
+                      ((v1 + s) & 0xFFFFFFFF) ^
+                      (((v1 >> 5) + k1) & 0xFFFFFFFF)))) & 0xFFFFFFFF
+        v1 = (v1 + (((((v0 << 4) & 0xFFFFFFFF) + k2) & 0xFFFFFFFF ^
+                      ((v0 + s) & 0xFFFFFFFF) ^
+                      (((v0 >> 5) + k3) & 0xFFFFFFFF)))) & 0xFFFFFFFF
+    return v0, v1
+
+
+async def tea_dec(v0, v1, k0, k1, k2, k3):
+    s = (_DELTA * _ROUNDS) & 0xFFFFFFFF
+    for _ in range(_ROUNDS):
+        v1 = (v1 - (((((v0 << 4) & 0xFFFFFFFF) + k2) & 0xFFFFFFFF ^
+                      ((v0 + s) & 0xFFFFFFFF) ^
+                      (((v0 >> 5) + k3) & 0xFFFFFFFF)))) & 0xFFFFFFFF
+        v0 = (v0 - (((((v1 << 4) & 0xFFFFFFFF) + k0) & 0xFFFFFFFF ^
+                      ((v1 + s) & 0xFFFFFFFF) ^
+                      (((v1 >> 5) + k1) & 0xFFFFFFFF)))) & 0xFFFFFFFF
+        s = (s - _DELTA) & 0xFFFFFFFF
+    return v0, v1
+
+
+async def tea_cbc_encrypt(padded, key_bytes):
+    k0, k1, k2, k3 = (struct.unpack_from("<I", key_bytes, o)[0] for o in (0, 4, 8, 12))
+    out = bytearray(len(padded))
+    prev_cipher = bytearray(8)
+    prev_intermediate = bytearray(8)
+    for i in range(0, len(padded), 8):
+        xored = bytearray(8)
+        for j in range(8):
+            xored[j] = padded[i + j] ^ prev_cipher[j]
+        e0, e1 = await tea_enc(
+            struct.unpack_from("<I", xored, 0)[0],
+            struct.unpack_from("<I", xored, 4)[0],
+            k0, k1, k2, k3,
+        )
+        enc = bytearray(8)
+        struct.pack_into("<I", enc, 0, e0)
+        struct.pack_into("<I", enc, 4, e1)
+        for j in range(8):
+            out[i + j] = enc[j] ^ prev_intermediate[j]
+        prev_cipher[:] = out[i:i + 8]
+        prev_intermediate[:] = xored
+    return bytes(out)
+
+
+async def tea_cbc_decrypt(body, key_bytes):
+    k0, k1, k2, k3 = (struct.unpack_from("<I", key_bytes, o)[0] for o in (0, 4, 8, 12))
+    out = bytearray(len(body))
+    prev_intermediate = bytearray(8)
+    prev_cipher = bytearray(8)
+    xored = bytearray(8)
+    dec = bytearray(8)
+    for i in range(0, len(body), 8):
+        for j in range(8):
+            xored[j] = body[i + j] ^ prev_intermediate[j]
+        d0, d1 = await tea_dec(
+            struct.unpack_from("<I", xored, 0)[0],
+            struct.unpack_from("<I", xored, 4)[0],
+            k0, k1, k2, k3
+        )
+        struct.pack_into("<I", dec, 0, d0)
+        struct.pack_into("<I", dec, 4, d1)
+        for j in range(8):
+            out[i + j] = dec[j] ^ prev_cipher[j]
+        prev_cipher[:] = body[i:i + 8]
+        prev_intermediate[:] = dec
+    return bytes(out)
+
+
+async def build_padded(content):
+    pad_len = (8 - (len(content) + 10) % 8) % 8
+    return bytes([pad_len, 0, 0]) + b"\x00" * pad_len + content + b"\x00" * 7
+
+
+async def encode_header(layout, send_option, cmd, order_id, flags, length, k, v80):
+    out = bytearray()
+    for code in layout:
+        value = {0: send_option, 1: cmd, 2: order_id, 3: flags, 4: length}[code]
+        if _FIELD_SIZES[code] == 1:
+            out.append((value & 0xFF) ^ k)
+        else:
+            v = ((value & 0xFFFF) ^ v80) & 0xFFFF
+            out.append(v & 0xFF)
+            out.append((v >> 8) & 0xFF)
+    return bytes(out)
+
+
+async def crc7_buff(crc, buf):
+    c = crc & 0x7F
+    for b in buf:
+        c = CRC7_TABLE[((2 * (c & 0xFF)) ^ (b & 0xFF)) & 0xFF] & 0x7F
+    return c & 0x7F
+
+
+async def sv_frame(msg_key, layout, send_option, cmd, order_id, flags, content, key, encrypted=True):
+    k = key[0]
+    v80 = ((k << 8) | k) & 0xFFFF
+    body = await tea_cbc_encrypt(await build_padded(content), key) if encrypted else content
+    hdr = bytearray([msg_key, 0]) + await encode_header(layout, send_option, cmd, order_id, flags, len(body), k, v80)
+    packet = bytearray(hdr + body)
+    packet[1] = await crc7_buff(0, bytes(packet[2:])) & 0x7F
+    return bytes(packet)
+
+
+async def build_match_startup_packets(token, udp_key, match_code, account_id, block_val,
+                                      server_ip="", region="BD", client_version="1.134.21",
+                                      client_version_code="2019121269", access_token=""):
+    token = token.strip()
+    udp_key = bytes.fromhex(udp_key)
+    match_code = [int(ch) for ch in str(match_code).strip()]
+
+    thunder_jwt = token[:660] if len(token) > 660 else token
+    sharma_jwt = token[660:] if len(token) > 660 else ""
+    encoded_thunder_jwt = thunder_jwt.encode() if isinstance(thunder_jwt, str) else thunder_jwt
+    encoded_sharma_jwt = sharma_jwt.encode() if isinstance(sharma_jwt, str) else sharma_jwt
+
+    garena420 = await has_ssan_zig(len(encoded_thunder_jwt)) + encoded_thunder_jwt
+    reg = str(region).upper() if region else "BD"
+    csoversea_block = bytes.fromhex(
+        "ca0163736f7665727365612e7374726f6e67686f6c642e66726565666972656d6f62696c652e636f6d"
+        "3b302e302e302e303b33342e3132362e37362e34353b33342e38372e3137372e31343b33342e38372e"
+        "3137302e3233303b33352e3138352e3138332e35370000000000000100000000000000000000000001"
+        "00000800000100000000000100a8a2d7bebd8d8bdf110200"
+    )
+
+    mid = bytes.fromhex('0000000001000102030101') + await has_ssan_zig(len(reg)) + reg.encode()
+    mid += bytes.fromhex('0001030003000004')
+    mid += await has_ssan_zig(len(client_version)) + client_version.encode()
+    mid += await has_ssan_zig(len(client_version_code)) + client_version_code.encode()
+    mid += csoversea_block
+
+    clean_ip = server_ip.split(':')[0] if server_ip else "0.0.0.0"
+    mid += await has_ssan_zig(len(clean_ip)) + clean_ip.encode()
+
+    clean_acc_tok = access_token.strip() if access_token else ""
+    if clean_acc_tok:
+        mid += await has_ssan_zig(len(clean_acc_tok)) + clean_acc_tok.encode()
+
+    mid += await has_ssan_zig(len(encoded_sharma_jwt)) + encoded_sharma_jwt
+
+    tg_garena420 = (
+        await uleb_encode(int(account_id)) +
+        await uleb_encode(int(block_val)) +
+        await uleb_encode(1) +
+        await uleb_encode(43) +
+        await uleb_encode(int(block_val)) +
+        await uleb_encode(11) +
+        mid
+    )
+
+    process = await sv_frame(0x5E, match_code, 2, 447, 0, 1, garena420, udp_key)
+    loading = await sv_frame(0x5A, match_code, 2, 448, 1, 1, tg_garena420, udp_key)
+    return process.hex(), loading.hex()
+
+
+async def produce_xor_key(secret_key):
+    k = secret_key[0] if secret_key and len(secret_key) > 0 else 10
+    return k, ((k << 8) | k) & 0xFFFF
+
+
+async def parse_layout(layout):
+    if isinstance(layout, str):
+        return [int(ch) for ch in layout.strip()]
+    return list(layout)
+
+
+async def build_hello_packet(text, key, layout):
+    data = text.encode("utf-8")
+    if len(data) > 25:
+        raise ValueError(f"Text is too long ({len(data)} bytes)")
+    content = b"\x10\x00\x00\x00" + data + b"\x00" * (29 - 4 - len(data))
+    k, v80 = await produce_xor_key(key)
+    layout = await parse_layout(layout)
+    padded = await build_padded(content)
+    enc_body = await tea_cbc_encrypt(padded, key)
+    header_bytes = await encode_header(layout, 1, 1, 0, 1, len(enc_body), k, v80)
+    packet = bytearray([0x63, 0x00]) + header_bytes + enc_body
+    packet[1] = await crc7_buff(0, packet[2:]) & 0x7F
+    return bytes(packet).hex()
+
+
+async def classify(frame):
+    cmd = frame["cmd"]
+    msg_name = MESSAGE_ID_TO_NAME.get(cmd, f"UNKNOWN_{cmd}")
+    if msg_name == "UDP_HELLO":
+        return "HELLO"
+    if msg_name == "UDP_ACK":
+        return "ACK"
+    if msg_name == "UDP_PING":
+        return "PING"
+    if msg_name == "RUDP_JOIN_MATCH":
+        return "JOIN_MATCH"
+    if msg_name.startswith("RUDP_") or msg_name.startswith("UDP_"):
+        return msg_name
+    return "DATA"
+
+
+async def build_packet(msg_key, layout, send_option, cmd, order_id, flags, content, key, encrypted=True):
+    k = key[0]
+    v80 = ((k << 8) | k) & 0xFFFF
+    body = await tea_cbc_encrypt(await build_padded(content), key) if encrypted else content
+    hdr = bytearray([msg_key, 0])
+    for code in layout:
+        value = {0: send_option, 1: cmd, 2: order_id, 3: flags, 4: len(body)}[code]
+        if _FIELD_SIZES[code] == 1:
+            hdr.append((value & 0xFF) ^ k)
+        else:
+            v = ((value & 0xFFFF) ^ v80) & 0xFFFF
+            hdr.append(v & 0xFF)
+            hdr.append((v >> 8) & 0xFF)
+    packet = bytearray(hdr + body)
+    packet[1] = await crc7_buff(0, bytes(packet[2:])) & 0x7F
+    return bytes(packet)
+
+
+async def layouts_from_mask(mask):
+    ru = [int(c) for c in str(mask).strip()]
+    nr = [c for c in ru if c != 2]
+    return ru, nr
+
+
+async def reply_for(frame, key, mask, ack_key=0x68, ping_key=0x6D, hello_key=0x5B, ack_style="short"):
+    ru, nr = await layouts_from_mask(mask)
+    typ = await classify(frame)
+    if typ == "HELLO":
+        if ack_style == "echo":
+            content = frame["content"] if frame["content"] else b"\x10\x00\x00\x00"
+            return typ, await build_packet(hello_key, nr, 1, 1, None, 1, content, key)
+        return typ, await build_packet(ack_key, nr, 0, 2, None, 1, b"\x01\x00", key)
+    if typ == "ACK":
+        content = frame["content"] if frame["content"] else b"\x01\x00"
+        return typ, await build_packet(ack_key, nr, 0, 2, None, 1, content, key)
+    if typ == "PING":
+        c = frame["content"]
+        counter = c[:4] if len(c) >= 4 else c
+        return typ, await build_packet(ping_key, nr, 0, 3, None, 0, counter + b"\x00\x00\x00", key, encrypted=False)
+    if typ == "JOIN_MATCH":
+        return typ, await build_packet(ack_key, nr, 0, 2, None, 1, b"\x02\x00", key)
+    return typ, None
+
+
+async def keepalive_ping(sock, ip, port, key_bytes, mask, stop_event):
+    nr = (await layouts_from_mask(mask))[1]
+    ping_keys = [0x66, 0x6D, 0x69, 0x6C, 0x6B, 0x6E, 0x6F, 0x70]
+    loop = asyncio.get_running_loop()
+    i = 0
+    while not stop_event.is_set():
+        pk = ping_keys[i % len(ping_keys)]
+        counter = int(time.time() * 1000) & 0xFFFFFFFF
+        pkt = await build_packet(pk, nr, 0, 3, None, 0, struct.pack("<I", counter) + b"\x00\x00\x00", key_bytes, encrypted=False)
+        try:
+            await loop.sock_sendto(sock, pkt, (ip, port))
+        except Exception:
+            pass
+        i += 1
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=3.0)
+        except asyncio.TimeoutError:
+            pass
+
+
+async def try_header(buf, layout, k, v80):
+    off = 2
+    out = {}
+    for code in layout:
+        size = _FIELD_SIZES[code]
+        if off + size > len(buf):
+            return None
+        out[_FIELD_NAMES[code]] = (buf[off] ^ k) if size == 1 else ((buf[off] | (buf[off + 1] << 8)) ^ v80) & 0xFFFF
+        off += size
+    out["headerLen"] = off
+    return out
+
+
+async def oicq_unpad(padded):
+    if not padded or len(padded) < 8:
+        return None
+    if not all(padded[-1 - i] == 0 for i in range(7)):
+        return None
+    pad_len = padded[0] & 0x07
+    s = 3 + pad_len
+    e = len(padded) - 7
+    return padded[s:e] if s < e else b""
+
+
+async def decode_packet(packet, key, mask=None):
+    data = bytes(packet) if isinstance(packet, bytes) else bytes.fromhex(packet)
+    if len(data) < 8:
+        return None
+    k = key[0]
+    v80 = ((k << 8) | k) & 0xFFFF
+    crc_ok = (data[1] & 0x7F) == await crc7_buff(0, data[2:])
+    candidates = []
+    if mask:
+        ru, nr = await layouts_from_mask(mask)
+        layouts = [("RUDP", ru), ("nonRUDP", nr)]
+    else:
+        layouts = [("RUDP", list(p)) for p in itertools.permutations([0, 1, 2, 3, 4])]
+        layouts += [("nonRUDP", list(p)) for p in itertools.permutations([0, 1, 3, 4])]
+    for kind, layout in layouts:
+        f = await try_header(data, layout, k, v80)
+        if not f:
+            continue
+        if f["flags"] > 7 or f["sendOption"] > 7:
+            continue
+        if f["length"] != len(data) - f["headerLen"]:
+            continue
+        body = data[f["headerLen"]:f["headerLen"] + f["length"]]
+        content = None
+        padded = None
+        if f["flags"] & 1:
+            if len(body) < 8 or len(body) % 8 != 0:
+                continue
+            padded = await tea_cbc_decrypt(body, key)
+            content = await oicq_unpad(padded)
+            if content is None:
+                continue
+        else:
+            content = body
+        score = (1 if crc_ok else 0) + (1 if content is not None else 0)
+        candidates.append({
+            "kind": kind, "layout": layout, "headerLen": f["headerLen"],
+            "msgKey": data[0], "cmd": f["cmd"], "flags": f["flags"],
+            "sendOption": f["sendOption"], "orderId": f.get("orderId"),
+            "length": f["length"], "content": content, "crcOk": crc_ok,
+            "padded": padded, "score": score, "total": len(data),
+        })
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: (c["kind"] in ("RUDP", "nonRUDP"), c["score"]), reverse=True)
+    return candidates[0]
+
+
+async def start_solo_match_packet(region, client_version, writer, key, iv):
+    """Sends solo match start packet directly for a single account without forming a squad."""
+    base_hex = (
+        "080112800a0a010b102b3a110a044944433110aa011a064555524f50453a100a044944433210311a064555524f504540014a0801090a0b1219202758016291090a80013038384638324246303241393637363730323031303130303030303030303030303031363030303130303135303030323232463937454545304630303030303034363736323531343030303030303030303030303030303030303030303030303030303030303030303030303066663030303030303030636163666131366410241afb02735d5e571400024a775d45414d1a041b1c001f11010449715f4243481a001e1d071c1703004b1a4066785c524570735c51486775421b5c5a4c07504042685a63610816054e19025e75196001477c015165406370195f5547404e4550640103020f1304064863754268676c755f65576e40467e5f0a417a4701026d675d6e73670b1108495a4c6a0b78470b740065645e525a057258425f584a447d4e6759440c11044e7c596d7f4b625f7d04055a47505c4e1d6b5b4107447d7201057d7f0f14084e430457674f7e517d72015172415d027473577c4d615f79535256780911030f4d5e027a797f614165067806505d53777750475e75064257076500460817014e741e7e5078487e7a7c465e7669767153497064605a7376677773550d160148037e18675966787f4c42607a645f577e7b441b460776026b18685d0b110205490060020f70676175654674706671797f41067346677c4e06585e780f15074c57047b40517075415f6364027259674b5b0166407f7340600407770a22047a5d5c52300b3a0a167305067162727516134208312e3133302e3232480350015ae90403626253513635686e556f4e36416456324b796f566c636f477776484f624e56526c4d727073504b4f43654177616848494176795556497273743752737149734a7a786b3247525268377a2f637664626d504f6a73552f79626d38547a4c69586d2f474351696d494b53486833447955726f39515152756c34545350626d6d624b7949565937545671577059455372323646572f59624578507338514f706d317372785455736c30796a434144444d4f34616a654b615753366361496c554b4963797a494e396d52516f715277687939797257476d337a644345337a6a61436f492f5a585233656f65365a42647a64677654636b6b665733356e4d4c6a6a565072564b6433523172756174394e50514150724a5546627859696c4c5a3859707336654d5447666b6649793574666a526c314d4648706b51774c6373374439656378566c41636f374e664f6d2b30654756466c4434744478706771385533595973587645384842502f70666c767a737138316a32524f4d7857437556445442492f684735625462773166456e4249725162762b636144775147696f74554e316d4c4b77734379456f4766706746614251457645672b736a764c4c78704743334c304a5344532f74526169504354553344374e6249306547516651622f5a466f4c36455630775a324d6f583932414c572f5049752f56634663584e70596b356f7966326151416a536971486a2f363276354843644f525551303578754e6171795251625653704654303137655237675255636b4966366c6f447476342b514e4a4670766d74757077707774396a5a5974437a4b56743657726d6e36785837706658456251555434684f3758a201050803108703a201050804108103a20105080510c001a20105081d10cc01a2010408161078a20105080e10af01a201020815"
+    )
+    raw_bytes = bytes.fromhex(base_hex)
+    if thunderFF_pb2 is not None and hasattr(thunderFF_pb2, "StartMatch"):
+        try:
+            proto = thunderFF_pb2.StartMatch()
+            proto.ParseFromString(raw_bytes)
+            if hasattr(proto.main, 'region_list') and len(proto.main.region_list) > 0:
+                proto.main.region_list[0].region = region
+                if len(proto.main.region_list) > 1:
+                    proto.main.region_list[1].region = region
+            if hasattr(proto.main, 'client_version'):
+                proto.main.client_version.remote_version = client_version
+            raw_bytes = proto.SerializeToString()
+        except Exception:
+            pass
+
+    enc_hex = AES.new(key, AES.MODE_CBC, iv).encrypt(pad(raw_bytes, AES.block_size)).hex()
+    pkt_len = len(enc_hex) // 2
+    hex_len = hex(pkt_len)[2:]
+    if len(hex_len) < 2:
+        hex_len = "0" + hex_len
+    final_hex = "031400" + "0" * (6 - len(hex_len)) + hex_len + enc_hex
+    writer.write(bytes.fromhex(final_hex))
+    await writer.drain()
+
 
 REGION_LANG = {
     "BD": "bn", "IND": "hi", "PK": "ur", "SG": "en", "ID": "id",
@@ -333,67 +866,6 @@ def build_ob55_online_auth(account_uid, token, kts, key, iv):
         + enc_token,
         enc_token
     )
-
-
-async def JoinSq_original(code, K, V):
-    skinz = {
-        1: 4,
-        2: {
-            4: "\u0001\u0007\t\n\u000b\u0012\u0019 '",
-            5: str(code),
-            6: 6,
-            8: 1,
-            9: {
-                1: "08FFF3BE903F27DF0203110111110000006B0003006800169194106F13CF106E4676251411010404dfe9e8b5ca3ca4f96a3119c00000004f03060301cacfa16d",
-                2: 130,
-                3: "tY_S\u0013\b\u0001M\u0002\u0000T\u0000\u0005\u000e\b\t\u0002\u0000\u0003U\u0003\u0001V\u000fR\u000e\tRQ\u0002\u0004\u0005US\u0003XS\u0005\u0001\u0002\u0011\u0001\u0002JuTAEN\u001e\u0002\u001c\u0002\u001f\u0013\b\u0003M\u001cDbz_Q@}p_QOgsC\u001dYVI\u0004UAAj_ga\u0004\u0012\u0000K\u001d\u0007_t\u0019b\bCx\u0002UeGat\u001fTTCBLER`\u0006\u0001\r\f\u0012\u0006\u0005N^^\u0002acH~r\u0004_\u0003RO|\u000bcd_@~`Rnqrgh\n\u0015\nL\\Nh\u0000~G\u000et\u0000eb]VQ\u0006t^F[ZIGxCdZD\u000b\u0011\u0002OA~LP@\u000fcSDyATQApaT^{|wa]\\\u0001E\u000f\u0013\nJfxve}\u0004J\u0003c{YL\u0007^^yDYQf\bhe\u0005_wg\r\u0010\u0007\bEHpX@||\u0002Z\\uTGyA\u0001JP\u0005t~VkTE\u0000J\\\u000b\u0013\nMr\u0018zTzK}qE]vnvwROuheYvwduvQ\r\u001a\u0005M\u0006z\u001dfXfzvHFc~dXUz}O\u001aB\u0005t\u0002i\u001co_\u0004\u0012\u0003\u0007J\u0006b\u0003\u000eqlfvbEstgu~wB\u0001v@`yI\u0002ZPx\f\u0014\u0003NR\u0002yBZvuD_cd\u0004q]lH]\u0007bD}pCe\t\u0004t\n",
-                4: "w^_R",
-                6: 11,
-                7: "\u0014\u0004aqrg\u0015\u0013",
-                8: "1.134.21",
-                9: 3,
-                10: 2,
-                11: "\u0003bbSQ6wxegh9qAdV2KyoVleA17yPmYF+yTnOrl+JMknmppeUBe5ZsiHueP2mZZ4KOs6b2Ail1S9z3qIeU9hGFZ2M6PP39/zjIc/RFVPAkgDagySswMVmYaPhkzU5IqNPow2843fyQUz9xI10NdMhl1WiI4Y6wCXBotiUS9wSgujQ4j0fWXUyklCxBWo8r27hyoGSVrPdTPXFMnJJpPRRFFmWqc3fWvMg+BNfxSRJOZRSrkzG0nNvSIJ4uZB2pqAlHIPEYx7bI6zsgwUVDiLZJKTUTyuCGbOd1DegDUFfazFesTG1LJknT5WhgzCsrBIy+f2l+LeJe5DW7wEwNaHambM7ECXcJcLIhB9kJJsW0tFvXkk3HSdcQ8N1K6wjSKWhpkW0kV8Zrjj0jkhS/7AZ6T9GJRIA827YDtTorBvbx1UkXjYrqYI1nSa2GaMexGnqlurc5DE3v1R+mUBI9GqmjEPgTSYVBxyeCdQMHaMXGtspAhvkiO84ToU87sP45pylDEfFOVoc/rcmdzWeqlYPsv6txKRtIHcb0cO+MoVShoU8ZUVRDF3znbqzVrscPIfplBaa79lwvQqzRubLl9XY="
-            },
-            11: {1: "IDC4", 2: 281, 3: "ME"},
-            13: "fr",
-            16: "7OR\u0019",
-            20: "\b\u0015",
-            27: "\bH\u0010\u0003"
-        }
-    }
-    return await GeneRaTePk((await CrEaTe_ProTo(skinz)).hex(), '0515', K, V)
-
-
-async def MahirAccepted(uid, code, K, V, region):
-    fields = {
-        1: 4,
-        2: {
-            1: int(uid),
-            3: int(uid),
-            8: 1,
-            9: {
-                1: "08FBA33CFF105FDD02030A01111100000003000100020000B687046B0D6D2083467625141101030175a63c900e748c3f6a311e04000000ff00040202cacfa16d",
-                2: 197,
-                3: "735154531406054a035305025a0e50560f5100040250020f5e0401520653000303505e0d520302501500064d705548424e1f051a001e12040a441d45677f5a56477574565e4f6274451d585849005a4f456d5b64670c1400496d017842740c670100040069536e72586c02016e657e566b524403081500044d0d515b637f757c19095c7c510b00417f565e5e066f5b584d6e02400a160e4d58496d0177400e750763605c575d0f7d5f475e5f4c407f4b60534b0b140549751e66407a4860726e44400e6103557e515c646f43577106077b60051b0f4b4e474e58457e4f615c01406000051e0361516e7b67614e040102540c1609004a0e40730f62517f446a135179507e706850547f7e7a67795553597c0a1206445b456640046265725c4d505d446d50737b7c42035970486370645e0b12034d506f5c7a1c554f574b0e765a0f0a7364505203477569456c6c420f0a1604014b647149136c186f795f5d78755e550e7842545e53747b08705f7f5d0a14004a08666b5a5b5f00045c7f5e584d72584262705f56055c61475564790515004b76514178587f52797a0f077a070953507d7f4d784f794f667b4256081b0e4a75627d4778417a06717574747c4c78557b4b7a0a697f0e714573600a",
-                4: "{Y_R",
-                6: 13,
-                7: "1c6f017306741513",
-                8: "1.134.21",
-                9: 2,
-                10: 1,
-                11: "036262535136784d584e38742b416456324b796f566c6537392f763672324d4773683377706379634f6b6b6f7447397934523930517432797246474c464c624c777a7747344d4d5257623146756d2b6556777a62597736743973492b787059612f55596e43465a59485235713348705830306c485a6f3632565145574e7145705866414c38734a754646575247386d376f5444566a4c484c576e714c52576f4e653236437a734c346a4144482b71694b55384d71476c5936546669544863716c487a345568463869396a365233366d49774b71746c36714f797568513854367945714b69742f45466d2b3636634b787649304f384d6c41385166454b6253467366477a2f30684e6a543873305369722f3962635a2f4679376c752f61632f366765704d415734566b442b36374f535756473665377a775a79312b797a42334b70632b7571782b577437414d39727761644439575765704570567849526d66654f5847627775787a68574b5664344c49586f415a364b387063647450627953575857455135706a542b653669365a2f6177444a3179356f774d5a534f64487262392b7877424a4d444f7848565a7a483372547a30314a316738517675466b656c3042433746473630683456427041494457487956684e794b4f5145507139467a4a6272686b316146306768766578512f6a2f484767426a5268675134645243372b477a5a687a2b77505967376454746f2b494d56363774642b54435653314234346b4148395a6d415872763758615941626477644e664f533170484875736b7336346f72463452534d3772656345417661484e61484854314c5545686e786a5a616d4d4f303d"
-            },
-            10: str(code),
-            11: {1: "IDC3", 2: 84, 3: "ME"},
-            13: "en",
-            16: "374f5219",
-            20: {1: 21},
-            23: "a_1477547277882450725",
-            27: {1: 2, 2: 8}
-        }
-    }
-    return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex(), '0515', K, V)
 
 
 def _pb_varint(n):
@@ -746,6 +1218,8 @@ async def do_login(uid, password, region_pref="ME", token_override=None):
             "auth_uid": str(uid),
             "bot_uid": str(major_res.account_uid),
             "token": major_res.token,
+            "access_token": access_token,
+            "client_version": client_version,
             "region": major_res.region or region_pref,
             "key": major_res.key or AES_KEY,
             "iv": major_res.iv or AES_IV,
@@ -764,12 +1238,15 @@ async def do_login(uid, password, region_pref="ME", token_override=None):
         }
 
 
-class SquadBot:
+class LevelUpBot:
+    """Individual account worker for Level-Up / Solo Match mode (no squad)."""
     def __init__(self, login, on_close=None):
         self.login = login
         self.auth_uid = str(login.get("auth_uid") or login["bot_uid"])
         self.uid = int(login["bot_uid"])
         self.token = login["token"]
+        self.access_token = login.get("access_token") or ""
+        self.client_version = login.get("client_version") or "1.134.21"
         self.key, self.iv = login["key"], login["iv"]
         self.ts = int(login["timestamp"])
         self.region = (login.get("region") or "ME")
@@ -792,13 +1269,13 @@ class SquadBot:
         self._chat_buf = bytearray()
         self._online_buf = bytearray()
         self._tasks = []
+        self._udp_tasks = []
         self.closed = False
         self.persistent = False
-        self._last_invite = None
         self.owner_uid = None
         self.voice_region_id = None
         self.chat_region_id = None
-        self._joined = asyncio.Event()
+        self._match_index = 0
 
     def _spawn(self, coro):
         t = asyncio.create_task(coro)
@@ -824,7 +1301,7 @@ class SquadBot:
                 self._pause_started_at = None
             self.is_paused = False
             if not self.closed:
-                self.status = "IN_MATCH" if self.in_team else "ONLINE"
+                self.status = "IN_MATCH" if self.active_matches > 0 else "ONLINE"
 
     def to_dict(self):
         return {
@@ -844,9 +1321,12 @@ class SquadBot:
 
     async def connect(self):
         r = self.login
+        chat_ip = await resolve_host_cloudflare(r["chat_ip"])
         self.chat_r, self.chat_w = await asyncio.wait_for(
-            asyncio.open_connection(r["chat_ip"], int(r["chat_port"])), 6
+            asyncio.open_connection(chat_ip, int(r["chat_port"])), 6
         )
+        if self.chat_w.get_extra_info('socket'):
+            optimize_tcp_socket(self.chat_w.get_extra_info('socket'))
         self.chat_w.write(bytes.fromhex(
             HELLXbuild_auth_startup(self.uid, self.token, self.ts, self.key, self.iv)
         ))
@@ -854,10 +1334,14 @@ class SquadBot:
         self._spawn(self._chat_read_loop())
         self._spawn(self._keepalive(self.chat_w))
         await asyncio.sleep(0.3)
+
         auth, _ = build_ob55_online_auth(self.uid, self.token, self.ts, self.key, self.iv)
+        online_ip = await resolve_host_cloudflare(r["online_ip"])
         self.online_r, self.online_w = await asyncio.wait_for(
-            asyncio.open_connection(r["online_ip"], int(r["online_port"])), 6
+            asyncio.open_connection(online_ip, int(r["online_port"])), 6
         )
+        if self.online_w.get_extra_info('socket'):
+            optimize_tcp_socket(self.online_w.get_extra_info('socket'))
         self.online_w.write(auth)
         await self.online_w.drain()
         self._spawn(self._online_read_loop())
@@ -876,60 +1360,191 @@ class SquadBot:
         except asyncio.CancelledError:
             pass
 
-    async def join(self, team_code, timeout=8):
-        global matches_started_total
-        self._joined.clear()
-        self.status = "SEARCHING"
-        self.online_w.write(await JoinSq_original(str(team_code), self.key, self.iv))
-        await self.online_w.drain()
+    async def play_udp_match(self, server_ip_port, thunder, sharma, udp_key, match_code, match_index: int):
+        """UDP match runner extracted from Level-Up code."""
+        global matches_completed_total
+        match_start_time = time.time()
+        ping_task = None
+        sock = None
+        ping_stop = asyncio.Event()
+        completed_cleanly = False
+
         try:
-            await asyncio.wait_for(self._joined.wait(), timeout)
-            self.matches_started += 1
-            self.active_matches = 1
-            matches_started_total += 1
-            self.status = "PAUSED" if self.is_paused else "IN_MATCH"
-            return True
-        except asyncio.TimeoutError:
-            self.status = "PAUSED" if self.is_paused else "ONLINE"
+            ip, port = server_ip_port.split(":")
+            port = int(port)
+            resolved_ip = await resolve_host_cloudflare(ip)
+            loop = asyncio.get_running_loop()
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            optimize_udp_socket(sock)
+            sock.setblocking(False)
+
+            udp_key_bytes = bytes.fromhex(udp_key)
+            hello_packet = await build_hello_packet(f"{self.uid}_2585", udp_key_bytes, match_code)
+            await loop.sock_sendto(sock, bytes.fromhex(hello_packet), (resolved_ip, port))
+
+            ack_state = "waiting_for_hello_reply"
+            thunder_sent = False
+            sharma_sent = False
+            join_match_received = False
+            local_closed = False
+            send_lock = asyncio.Lock()
+
+            ping_task = asyncio.create_task(
+                keepalive_ping(sock, resolved_ip, port, udp_key_bytes, match_code, ping_stop)
+            )
+            last_activity = time.time()
+            max_idle_before_hello_resend = 7.0
+
+            async def send_thunder_sharma_inline():
+                nonlocal ack_state, thunder_sent, sharma_sent
+                if thunder_sent:
+                    return
+                async with send_lock:
+                    if thunder_sent:
+                        return
+                    await loop.sock_sendto(sock, bytes.fromhex(thunder), (resolved_ip, port))
+                    thunder_sent = True
+                    await asyncio.sleep(0.1)
+                    prepare_ack = await build_packet(
+                        0x68, (await layouts_from_mask(match_code))[1],
+                        0, 2, None, 1, b"\x01\x00", udp_key_bytes
+                    )
+                    await loop.sock_sendto(sock, prepare_ack, (resolved_ip, port))
+                    await asyncio.sleep(0.2)
+                    await loop.sock_sendto(sock, bytes.fromhex(sharma), (resolved_ip, port))
+                    sharma_sent = True
+                    ack_state = "thunder_sharma_sent"
+                    push_log(f"[MATCH #{match_index}] Thunder+Sharma sent for {self.name} ({self.uid})", "match")
+
+            while not local_closed:
+                if time.time() - match_start_time > MAX_MATCH_DURATION:
+                    break
+                try:
+                    response, server_addr = await asyncio.wait_for(
+                        loop.sock_recvfrom(sock, 65535), timeout=1.5
+                    )
+                    if response:
+                        last_activity = time.time()
+                        frame = await decode_packet(response, udp_key_bytes, match_code)
+                        if frame:
+                            ptype = await classify(frame)
+                            if frame.get('cmd') in [103, 107]:
+                                completed_cleanly = True
+                                local_closed = True
+                                continue
+                            if frame.get('cmd') == 101:
+                                ack_pkt = await build_packet(
+                                    0x68, (await layouts_from_mask(match_code))[1],
+                                    0, 2, None, 1, b"\x01\x00", udp_key_bytes
+                                )
+                                await loop.sock_sendto(sock, ack_pkt, server_addr)
+                                continue
+                            if ptype in ["ACK", "PING", "HELLO", "JOIN_MATCH"]:
+                                if ptype == "HELLO" and ack_state == "waiting_for_hello_reply":
+                                    _, reply = await reply_for(frame, udp_key_bytes, match_code, ack_style="short")
+                                    if reply:
+                                        await loop.sock_sendto(sock, reply, server_addr)
+                                    ack_state = "ack_sent_waiting"
+                                elif ptype == "ACK":
+                                    if ack_state == "waiting_for_hello_reply":
+                                        _, reply = await reply_for(frame, udp_key_bytes, match_code)
+                                        if reply:
+                                            await loop.sock_sendto(sock, reply, server_addr)
+                                        ack_state = "ready_to_send_thunder"
+                                    elif ack_state == "ack_sent_waiting":
+                                        ack_state = "ready_to_send_thunder"
+                                    else:
+                                        _, reply = await reply_for(frame, udp_key_bytes, match_code)
+                                        if reply:
+                                            await loop.sock_sendto(sock, reply, server_addr)
+                                elif ptype == "PING":
+                                    _, reply = await reply_for(frame, udp_key_bytes, match_code)
+                                    if reply:
+                                        await loop.sock_sendto(sock, reply, server_addr)
+                                elif ptype == "JOIN_MATCH" and not join_match_received:
+                                    _, reply = await reply_for(frame, udp_key_bytes, match_code)
+                                    if reply:
+                                        await loop.sock_sendto(sock, reply, server_addr)
+                                        join_match_received = True
+                except asyncio.TimeoutError:
+                    if ack_state == "ready_to_send_thunder" and not thunder_sent:
+                        await send_thunder_sharma_inline()
+                    elif ack_state == "waiting_for_hello_reply":
+                        if (time.time() - last_activity) > max_idle_before_hello_resend:
+                            try:
+                                pkt = await build_hello_packet(f"{self.uid}_2585", udp_key_bytes, match_code)
+                                await loop.sock_sendto(sock, bytes.fromhex(pkt), (resolved_ip, port))
+                            except Exception:
+                                pass
+                            last_activity = time.time()
+                        if (time.time() - match_start_time) > 25.0:
+                            break
+                    elif ack_state == "thunder_sharma_sent":
+                        if (time.time() - last_activity) > MATCH_IDLE_TIMEOUT:
+                            completed_cleanly = True
+                            break
+                    continue
+                except BlockingIOError:
+                    await asyncio.sleep(0.05)
+                except OSError:
+                    await asyncio.sleep(0.5)
+                    continue
+                except Exception:
+                    await asyncio.sleep(0.5)
+                    continue
+
+                if ack_state == "ready_to_send_thunder" and not thunder_sent:
+                    await send_thunder_sharma_inline()
+
+            if completed_cleanly:
+                self.matches_completed += 1
+                matches_completed_total += 1
+                self.gained_exp += 65
+                self.current_exp += 65
+        except Exception as e:
+            push_log(f"[MATCH #{match_index}] UDP error ({self.uid}): {e}", "warning")
+        finally:
+            ping_stop.set()
+            if ping_task and not ping_task.done():
+                ping_task.cancel()
+                try:
+                    await ping_task
+                except asyncio.CancelledError:
+                    pass
+            if sock:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+            self.active_matches = max(0, self.active_matches - 1)
+            if not self.is_paused and not self.closed:
+                self.status = "IN_MATCH" if self.active_matches > 0 else "ONLINE"
+
+    async def start_solo_match(self, timeout=8):
+        """Starts a solo match individually for THIS single account only (no squad)."""
+        global matches_started_total
+        if self.closed or self.is_paused:
+            return False
+        if not self.online_w or self.online_w.transport.is_closing():
             return False
 
-    async def _on_joined(self, f5):
-        self.voice_region_id = int(f5.get("17"))
-        self.chat_region_id = int(self.voice_region_id / 256 + 0.5) * 256
+        self.status = "SEARCHING"
         try:
-            self.owner_uid = int(f5.get("1", self.uid))
-        except Exception:
-            self.owner_uid = self.uid
-        self._joined.set()
-        try:
-            self.chat_w.write(HELLXbuild_chat_auth(self.owner_uid, str(self.chat_region_id), self.key, self.iv))
-            await self.chat_w.drain()
+            await start_solo_match_packet(
+                self.region, self.client_version, self.online_w, self.key, self.iv
+            )
+            self._match_index += 1
+            self.matches_started += 1
+            matches_started_total += 1
+            self.active_matches = max(1, self.active_matches)
+            if not self.is_paused:
+                self.status = "IN_MATCH"
+            push_log(f"Solo match #{self._match_index} started for {self.name} ({self.uid})", "match")
+            return True
         except Exception as e:
-            push_log(f"chat auth failed: {e}", "warning")
-
-    async def leave(self):
-        global matches_completed_total
-        try:
-            self.online_w.write(await ExiT(None, self.key, self.iv))
-            await self.online_w.drain()
-        except Exception:
-            pass
-        if self.in_team:
-            self.matches_completed += 1
-            matches_completed_total += 1
-        self.active_matches = 0
-        self._reset_team()
-        self.status = "PAUSED" if self.is_paused else "ONLINE"
-
-    def _reset_team(self):
-        self.voice_region_id = self.chat_region_id = self.owner_uid = None
-        self.active_matches = 0
-        self._last_invite = None
-        self._joined.clear()
-
-    @property
-    def in_team(self):
-        return bool(self.voice_region_id)
+            push_log(f"start_solo_match error ({self.uid}): {e}", "warning")
+            self.status = "PAUSED" if self.is_paused else "ONLINE"
+            return False
 
     async def _online_read_loop(self):
         try:
@@ -938,6 +1553,38 @@ class SquadBot:
                 if not data:
                     break
                 self._online_buf.extend(data)
+                hex_data = data.hex()
+                packet_length = len(data)
+                if hex_data.startswith("0300") and packet_length >= 300:
+                    try:
+                        parsed = Parser().parse(hex_data[10:])
+                        res = json.loads(json.dumps(await parse_results(parsed)))
+                        token = udp_key = match_code = server_ip_port = block_val = None
+                        if '42' in res and 'data' in res['42']:
+                            match_code = res['42']['data']
+                        if '5' in res and 'data' in res['5']:
+                            f5 = res['5']['data']
+                            server_ip_port = f5.get('2', {}).get('data')
+                            udp_key = f5.get('3', {}).get('data')
+                            token = f5.get('4', {}).get('data')
+                            block_val = f5.get('1', {}).get('data')
+                            if '42' in f5:
+                                match_code = f5['42']['data']
+                        if token and udp_key and match_code and server_ip_port:
+                            thunder, sharma = await build_match_startup_packets(
+                                token, udp_key, match_code, self.uid, block_val or 0,
+                                server_ip=server_ip_port, region=self.region,
+                                client_version=self.client_version, access_token=self.access_token
+                            )
+                            self.active_matches += 1
+                            if not self.is_paused:
+                                self.status = "IN_MATCH"
+                            udp_t = asyncio.create_task(
+                                self.play_udp_match(server_ip_port, thunder, sharma, udp_key, match_code, self._match_index)
+                            )
+                            self._udp_tasks.append(udp_t)
+                    except Exception:
+                        pass
                 await self._drain_frames(self._online_buf, self._on_online_packet)
         except asyncio.CancelledError:
             return
@@ -980,59 +1627,24 @@ class SquadBot:
             del buf[:pos]
 
     async def _on_online_packet(self, pd):
-        f5 = pd.get("5")
-        if not isinstance(f5, dict):
-            return
-        code = f5.get("8")
-        if isinstance(code, str) and "_" in code and code != self._last_invite                 and self.persistent and not self.in_team and not self.is_paused:
-            self._last_invite = code
-            try:
-                owner = int(f5.get("1", self.uid))
-                self.online_w.write(await MahirAccepted(owner, code, self.key, self.iv, self.region))
-                await self.online_w.drain()
-            except Exception as e:
-                push_log(f"accept invite failed: {e}", "warning")
-        if not self.voice_region_id and f5.get("17"):
-            await self._on_joined(f5)
+        return
 
     async def _on_chat_packet(self, pd):
         return
-
-    async def say(self, message):
-        if self.is_paused:
-            return
-        if not self.chat_w or self.chat_w.transport.is_closing():
-            return
-        try:
-            owner = self.owner_uid or self.uid
-            pkt = await HELLXbuild_chat_message(
-                self.uid, owner, message, int(time.time()), self.key, self.iv, name=self.name
-            )
-            self.chat_w.write(pkt)
-            await self.chat_w.drain()
-        except Exception as e:
-            push_log(f"send failed ({self.uid}): {e}", "warning")
 
     async def close(self):
         if self.closed:
             return
         self.closed = True
         self.status = "PAUSED" if self.is_paused else "OFFLINE"
-        self._reset_team()
         for w in (self.online_w, self.chat_w):
             if w:
-                try:
-                    if w is self.online_w and not w.transport.is_closing():
-                        w.write(await ExiT(None, self.key, self.iv))
-                        await w.drain()
-                except Exception:
-                    pass
                 try:
                     w.close()
                 except Exception:
                     pass
         me = asyncio.current_task()
-        for t in self._tasks:
+        for t in list(self._tasks) + list(self._udp_tasks):
             if t is not me and not t.done():
                 t.cancel()
         if self.on_close:
@@ -1127,7 +1739,7 @@ class AccountPool:
         if not login:
             return None
 
-        bot = SquadBot(login)
+        bot = LevelUpBot(login)
         bot.is_paused = all_paused_flag
         if bot.is_paused:
             bot.status = "PAUSED"
@@ -1268,53 +1880,11 @@ class AccountPool:
 
 
 account_pool = AccountPool(concurrency=12)
-spam_tasks = {}
 
 
-async def _spam_loop(bot, team_code, text, interval=1.1):
-    key = str(team_code)
-    try:
-        while not bot.closed and bot.in_team:
-            if not bot.is_paused:
-                await bot.say(text)
-            await asyncio.sleep(interval)
-    except asyncio.CancelledError:
-        pass
-    except Exception as e:
-        push_log(f"spam loop error ({key}): {e}", "warning")
-    finally:
-        if spam_tasks.get(key) is asyncio.current_task():
-            spam_tasks.pop(key, None)
-
-
-async def run_tmc_spam(team_code, text, interval=1.1):
-    team_code = str(team_code).strip()
-    text = unquote(str(text or "")).strip()
-    if not team_code.isdigit() or not text:
-        return False, "Invalid team_code or empty text"
-
-    bot = await account_pool.wait_for_account()
-    if not bot:
-        return False, "No connected accounts available yet"
-
-    if not getattr(bot, "in_team", False):
-        joined = await bot.join(team_code, timeout=8)
-        if not joined:
-            return False, "Failed to join team"
-        await asyncio.sleep(0.5)
-        push_log(f"Success joined team {team_code}", "match")
-
-    old_task = spam_tasks.get(team_code)
-    if old_task and not old_task.done():
-        old_task.cancel()
-
-    task = asyncio.create_task(_spam_loop(bot, team_code, text, interval=interval))
-    spam_tasks[team_code] = task
-    return True, "Joined and started spamming"
-
-
-async def _create_team_worker(region, clan_id, count, password):
-    push_log(f"Creating {count} guest bots in region {region} (Clan: {clan_id})...", "info")
+async def _create_levelup_worker(region, clan_id, count, password):
+    """Creates individual guest accounts for Level-Up mode without forming squads."""
+    push_log(f"Creating {count} guest bots in region {region} for Level-Up mode...", "info")
     created = 0
     for _ in range(count):
         guest_uid = str(random.randint(3000000000, 4999999999))
@@ -1322,165 +1892,79 @@ async def _create_team_worker(region, clan_id, count, password):
         if bot:
             created += 1
         await asyncio.sleep(0.4)
-    push_log(f"Team creation finished: {created}/{count} bots connected in {region}", "success" if created else "warning")
-
+    push_log(f"Level-Up account creation finished: {created}/{count} bots connected in {region}", "success" if created else "warning")
 
 
 # =====================================================================
-# SQUAD & AUTO-MATCH MANAGER (4 ACCOUNTS)
+# LEVEL-UP / SOLO MATCH MANAGER (INDIVIDUAL ACCOUNTS â NO SQUAD)
 # =====================================================================
 
-class SquadMatchManager:
+class LevelUpMatchManager:
     def __init__(self, pool):
         self.pool = pool
-        self.active_squads = {}  # squad_id -> dict state
         self.lock = asyncio.Lock()
-        self.auto_squad_enabled = True
+        self.auto_match_enabled = True
 
-    def _pick_four_bots(self):
-        # Prefer bots not currently paused or closed; take up to 4
-        candidates = [b for b in self.pool.accounts if not b.closed and not b.is_paused]
-        if len(candidates) < 4:
-            # include paused if needed to inspect, but only active ones can join/start match
-            candidates = [b for b in self.pool.accounts if not b.closed]
-        return candidates[:4]
-
-    async def start_match_packet(self, leader_bot, members):
-        """
-        Send start-match / team-match packet over online socket using existing proto helpers.
-        Also updates match counters and logs clearly.
-        """
-        global matches_started_total
-        try:
-            # Protobuf payload for starting team match from squad leader
-            match_fields = {
-                1: 5,
-                2: {
-                    1: int(leader_bot.uid),
-                    2: str(leader_bot.voice_region_id or ""),
-                    3: 1,
-                    4: [int(m.uid) for m in members],
-                }
-            }
-            pkt = await GeneRaTePk((await CrEaTe_ProTo(match_fields)).hex(), "0515", leader_bot.key, leader_bot.iv)
-            if leader_bot.online_w and not leader_bot.online_w.transport.is_closing():
-                leader_bot.online_w.write(pkt)
-                await leader_bot.online_w.drain()
-        except Exception as e:
-            push_log(f"start_match packet warning ({leader_bot.uid}): {e}", "warning")
-
-        for b in members:
-            b.matches_started += 1
-            b.active_matches = 1
-            if not b.is_paused:
-                b.status = "IN_MATCH"
-        matches_started_total += 1
-        push_log(
-            f"Match started with {len(members)} squad accounts (Leader: {leader_bot.name} / {leader_bot.uid})",
-            "match"
-        )
-
-    async def form_squad_and_start_match(self, team_code="", auto_start_match=True):
+    async def start_matches_for_accounts(self, target_uid=""):
         async with self.lock:
-            active_bots = [b for b in self.pool.accounts if not b.closed and not b.is_paused]
-            if len(active_bots) < 4:
-                msg = f"Need 4 active connected accounts to form squad (currently {len(active_bots)} connected)"
-                push_log(msg, "warning")
+            if target_uid:
+                bot = await self.pool.find_bot(target_uid)
+                if not bot or bot.closed or bot.is_paused:
+                    msg = f"Account {target_uid} is not available or is paused"
+                    push_log(msg, "warning")
+                    return {"ok": False, "error": msg, "started_count": 0}
+                ok = await bot.start_solo_match()
                 return {
-                    "ok": False,
-                    "error": msg,
-                    "connected_count": len(active_bots),
-                    "required": 4,
+                    "ok": ok,
+                    "error": None if ok else f"Failed to start solo match for {target_uid}",
+                    "started_count": 1 if ok else 0,
+                    "mode": "level_up_solo",
                 }
 
-            squad_bots = active_bots[:4]
-            leader = squad_bots[0]
-            members = squad_bots[1:]
+            active_bots = [b for b in self.pool.accounts if not b.closed and not b.is_paused]
+            if not active_bots:
+                msg = "No active connected accounts available to start solo match"
+                push_log(msg, "warning")
+                return {"ok": False, "error": msg, "started_count": 0, "mode": "level_up_solo"}
 
-            squad_id = f"SQ-{leader.uid}-{int(time.time()) % 10000}"
-            code_to_use = str(team_code).strip() if str(team_code).strip() else str(leader.uid)
-
+            results = await asyncio.gather(*(b.start_solo_match() for b in active_bots), return_exceptions=True)
+            started_count = sum(1 for r in results if r is True)
             push_log(
-                f"Forming squad {squad_id} with 4 accounts: {[b.name for b in squad_bots]}",
-                "info"
+                f"Level-Up solo matches started for {started_count}/{len(active_bots)} individual account(s)",
+                "match" if started_count else "warning"
             )
-
-            # Ensure leader has a team/squad state or joins code_to_use
-            joined_results = []
-            for idx, bot in enumerate(squad_bots):
-                try:
-                    if not bot.in_team:
-                        bot.status = "SEARCHING"
-                        if bot.online_w and not bot.online_w.transport.is_closing():
-                            bot.online_w.write(await JoinSq_original(code_to_use, bot.key, bot.iv))
-                            await bot.online_w.drain()
-                        try:
-                            await asyncio.wait_for(bot._joined.wait(), timeout=2.5)
-                        except asyncio.TimeoutError:
-                            # Fallback squad context if server doesn't echo field 17 immediately
-                            if not bot.voice_region_id:
-                                bot.voice_region_id = 1024
-                                bot.chat_region_id = 1024
-                                bot.owner_uid = int(leader.uid)
-                                bot._joined.set()
-                    if not bot.is_paused:
-                        bot.status = "IN_SQUAD"
-                    joined_results.append({"uid": str(bot.uid), "nickname": bot.name, "in_squad": True})
-                except Exception as e:
-                    push_log(f"Squad join step notice for {bot.uid}: {e}", "warning")
-                    joined_results.append({"uid": str(bot.uid), "nickname": bot.name, "in_squad": False})
-
-            in_count = sum(1 for r in joined_results if r["in_squad"])
-            squad_record = {
-                "squad_id": squad_id,
-                "leader_uid": str(leader.uid),
-                "leader_name": leader.name,
-                "team_code": code_to_use,
-                "members": joined_results,
-                "count": in_count,
-                "match_started": False,
-                "created_at": datetime.now().strftime("%H:%M:%S"),
-            }
-            self.active_squads[squad_id] = squad_record
-
-            if in_count == 4 and auto_start_match:
-                await asyncio.sleep(0.4)
-                await self.start_match_packet(leader, squad_bots)
-                squad_record["match_started"] = True
-
             return {
-                "ok": True,
-                "squad_id": squad_id,
-                "squad": squad_record,
-                "match_started": squad_record["match_started"],
+                "ok": started_count > 0,
+                "error": None if started_count > 0 else "Failed to start solo matches",
+                "started_count": started_count,
+                "total_eligible": len(active_bots),
+                "mode": "level_up_solo",
             }
 
 
-squad_manager = SquadMatchManager(account_pool)
+levelup_manager = LevelUpMatchManager(account_pool)
 
 
-async def _auto_squad_watcher():
-    """Watches connected accounts and forms a 4-bot squad + starts match as soon as 4 active bots are ready."""
-    triggered_groups = set()
+async def _auto_levelup_watcher():
+    """Watches connected accounts and starts solo matches individually for each active account (no squad)."""
     while True:
         try:
-            await asyncio.sleep(2.0)
-            if not squad_manager.auto_squad_enabled or all_paused_flag:
+            await asyncio.sleep(START_MATCH_INTERVAL)
+            if not levelup_manager.auto_match_enabled or all_paused_flag:
                 continue
-            active = [b for b in account_pool.accounts if not b.closed and not b.is_paused and b.active_matches == 0]
-            if len(active) >= 4:
-                group_key = tuple(sorted(str(b.uid) for b in active[:4]))
-                if group_key not in triggered_groups:
-                    triggered_groups.add(group_key)
-                    push_log("4 accounts ready -> auto forming squad & starting match...", "match")
-                    await squad_manager.form_squad_and_start_match(auto_start_match=True)
+            idle_bots = [
+                b for b in account_pool.accounts
+                if not b.closed and not b.is_paused and b.active_matches == 0
+            ]
+            if idle_bots:
+                await asyncio.gather(*(b.start_solo_match() for b in idle_bots), return_exceptions=True)
         except asyncio.CancelledError:
             break
         except Exception as e:
-            push_log(f"auto_squad_watcher error: {e}", "warning")
+            push_log(f"auto_levelup_watcher error: {e}", "warning")
 
 
-async_loop.start_background(_auto_squad_watcher())
+async_loop.start_background(_auto_levelup_watcher())
 
 
 app = Flask(__name__)
@@ -1489,27 +1973,8 @@ app = Flask(__name__)
 async_loop.start_background(account_pool.load_and_connect())
 
 
-def _parse_tmc_request():
-    raw_tmc = request.args.get("tmc") or request.args.get("team_code") or ""
-    raw_text = request.args.get("text") or ""
+FALLBACK_HTML = '<!DOCTYPE html>\n<html lang="ar" dir="rtl">\n<head>\n  <meta charset="UTF-8" />\n  <meta name="viewport" content="width=device-width, initial-scale=1.0" />\n  <title>Ø±Ø§ÙÙÙ ÙØµÙ - ÙÙÙ Ø£Ø¨ ÙØ±Ø¯Ù</title>\n  <style>\n    body { font-family: Tahoma, Arial, sans-serif; background: #0d0b14; color: #f3effa; margin: 0; padding: 16px; }\n    .card { background: #171324; border: 1px solid #2b2342; border-radius: 14px; padding: 16px; margin-bottom: 14px; }\n    .btn { background: linear-gradient(135deg, #7c3aed, #5b21b6); color: #fff; border: none; padding: 12px 18px; border-radius: 10px; font-size: 15px; font-weight: bold; cursor: pointer; margin: 4px; }\n    .btn-green { background: linear-gradient(135deg, #059669, #047857); }\n    .btn-gray { background: #2c2440; }\n    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }\n    .stat { background: #110e1c; padding: 12px; border-radius: 10px; text-align: center; }\n    .acc { background: #110e1c; padding: 12px; border-radius: 10px; margin-top: 8px; display: flex; justify-content: space-between; align-items: center; }\n    .badge { padding: 4px 10px; border-radius: 999px; font-size: 12px; background: #1e3a2f; color: #34d399; }\n    .logs { background: #09070f; padding: 10px; border-radius: 10px; max-height: 240px; overflow-y: auto; font-family: monospace; font-size: 12px; direction: ltr; text-align: left; }\n    input { background: #0e0b18; color: #fff; border: 1px solid #352b52; padding: 8px 10px; border-radius: 8px; margin: 4px; }\n  </style>\n</head>\n<body>\n  <div class="card">\n    <h2>â¡ Ø±Ø§ÙÙÙ ÙØµÙ â ÙØ¶Ø¹ ÙÙÙ Ø£Ø¨ Ø§ÙÙØ±Ø¯Ù (Ø¨Ø¯ÙÙ Ø³ÙÙØ§Ø¯)</h2>\n    <button id="btnSoloMatch" class="btn btn-green" onclick="startSoloMatch()">ð Ø¨Ø¯Ø¡ ÙØ§ØªØ´ ÙÙÙ Ø£Ø¨ ÙØ±Ø¯Ù ÙÙÙ Ø­Ø³Ø§Ø¨</button>\n    <button class="btn btn-gray" onclick="toggleAutoMatch()">ð ØªØ¨Ø¯ÙÙ Ø§ÙØªØ´ØºÙÙ Ø§ÙØªÙÙØ§Ø¦Ù</button>\n    <button class="btn" onclick="openAddForm()">â Ø¥Ø¶Ø§ÙØ© Ø­Ø³Ø§Ø¨</button>\n    <div id="addBox" style="display:none; margin-top:10px;">\n      <input id="inpUid" placeholder="UID" />\n      <input id="inpPass" placeholder="Password" />\n      <input id="inpRegion" value="ME" style="width:65px" />\n      <button class="btn" onclick="addAccount()">Ø­ÙØ¸ ÙØ§ØªØµØ§Ù</button>\n    </div>\n    <div id="msgBox" style="margin-top:10px; color:#a78bfa;"></div>\n  </div>\n\n  <div class="card grid">\n    <div class="stat"><div>Ø§ÙØ­Ø³Ø§Ø¨Ø§Øª Ø§ÙÙØªØµÙØ©</div><h3 id="sAccs">0</h3></div>\n    <div class="stat"><div>Ø§ÙÙØ§ØªØ´Ø§Øª Ø§ÙÙØ¨Ø¯ÙØ¡Ø©</div><h3 id="sMatches">0</h3></div>\n    <div class="stat"><div>Ø§ÙÙ EXP Ø§ÙÙÙØªØ³Ø¨</div><h3 id="sExp">0</h3></div>\n    <div class="stat"><div>Ø§ÙØªØ´ØºÙÙ Ø§ÙØªÙÙØ§Ø¦Ù</div><h3 id="sAuto">ÙÙØ¹Ù</h3></div>\n  </div>\n\n  <div class="card">\n    <h3>Ø§ÙØ­Ø³Ø§Ø¨Ø§Øª</h3>\n    <div id="accsList"></div>\n  </div>\n\n  <div class="card">\n    <h3>Ø³Ø¬Ù Ø§ÙØ£Ø­Ø¯Ø§Ø«</h3>\n    <div id="logsBox" class="logs"></div>\n  </div>\n\n  <script>\n    function openAddForm() {\n      const el = document.getElementById("addBox");\n      el.style.display = el.style.display === "none" ? "block" : "none";\n    }\n    async function addAccount() {\n      const uid = document.getElementById("inpUid").value.trim();\n      const password = document.getElementById("inpPass").value.trim();\n      const region = document.getElementById("inpRegion").value.trim() || "ME";\n      const r = await fetch("/api/account/add", {\n        method: "POST",\n        headers: {"Content-Type": "application/json"},\n        body: JSON.stringify({uid, password, region})\n      });\n      const d = await r.json();\n      document.getElementById("msgBox").innerText = d.status === "ok" ? ("ØªÙ Ø±Ø¨Ø· Ø§ÙØ­Ø³Ø§Ø¨: " + d.nickname) : (d.error || "ÙØ´Ù Ø§ÙØ±Ø¨Ø·");\n      refreshStats();\n    }\n    async function startSoloMatch() {\n      const btn = document.getElementById("btnSoloMatch");\n      btn.disabled = true;\n      document.getElementById("msgBox").innerText = "Ø¬Ø§Ø±Ù Ø¨Ø¯Ø¡ ÙØ§ØªØ´ ÙÙÙ Ø£Ø¨ ÙØ±Ø¯Ù...";\n      try {\n        const r = await fetch("/api/match/start", {\n          method: "POST",\n          headers: {"Content-Type": "application/json"},\n          body: JSON.stringify({})\n        });\n        const d = await r.json();\n        if (d.ok) {\n          document.getElementById("msgBox").innerText = "â ØªÙ Ø¨Ø¯Ø¡ Ø§ÙÙØ§ØªØ´ Ø§ÙÙØ±Ø¯Ù (" + (d.started_count || 0) + " Ø­Ø³Ø§Ø¨)";\n        } else {\n          document.getElementById("msgBox").innerText = "â ï¸ " + (d.error || "ØªØ¹Ø°Ø± Ø¨Ø¯Ø¡ Ø§ÙÙØ§ØªØ´");\n        }\n      } catch (e) {\n        document.getElementById("msgBox").innerText = "â Ø®Ø·Ø£ ÙÙ Ø§ÙØ§ØªØµØ§Ù Ø¨Ø§ÙØ³ÙØ±ÙØ±";\n      } finally {\n        btn.disabled = false;\n        refreshStats();\n      }\n    }\n    async function toggleAutoMatch() {\n      const r = await fetch("/api/match/auto", {method: "POST", headers: {"Content-Type": "application/json"}, body: "{}"});\n      const d = await r.json();\n      document.getElementById("msgBox").innerText = "Ø§ÙØªØ´ØºÙÙ Ø§ÙØªÙÙØ§Ø¦Ù ÙÙÙ Ø£Ø¨: " + (d.auto_match_enabled ? "ÙÙØ¹Ù" : "ÙØªÙÙÙ");\n      refreshStats();\n    }\n    async function refreshStats() {\n      const r = await fetch("/api/stats");\n      const d = await r.json();\n      document.getElementById("sAccs").innerText = d.total_accounts || 0;\n      document.getElementById("sMatches").innerText = d.total_matches_started || 0;\n      document.getElementById("sExp").innerText = d.total_gained_exp || 0;\n      document.getElementById("sAuto").innerText = d.auto_match_enabled ? "ÙÙØ¹Ù" : "ÙØªÙÙÙ";\n      const list = document.getElementById("accsList");\n      list.innerHTML = (d.accounts || []).map(a =>\n        `<div class="acc"><div><b>${a.nickname}</b> (${a.uid}) | EXP: ${a.gained_exp || 0}</div><span class="badge">${a.status}</span></div>`\n      ).join("") || "<div>ÙØ§ ØªÙØ¬Ø¯ Ø­Ø³Ø§Ø¨Ø§Øª ÙØªØµÙØ© Ø­Ø§ÙÙØ§Ù</div>";\n      const logs = document.getElementById("logsBox");\n      logs.innerHTML = (d.logs || []).slice(-60).map(l => `<div>[${l.time}] [${l.level}] ${l.message}</div>`).join("");\n      logs.scrollTop = logs.scrollHeight;\n    }\n    setInterval(refreshStats, 2500);\n    refreshStats();\n  </script>\n</body>\n</html>\n'
 
-    full_path = request.full_path or ""
-    match = re.search(r"/tmc=([^&/?]+)(?:&text=(.*))?$", full_path)
-    if match:
-        if not raw_tmc:
-            raw_tmc = match.group(1) or ""
-        if not raw_text and match.group(2) is not None:
-            raw_text = match.group(2).rstrip("?")
-
-    if request.method == "POST":
-        body = request.get_json(silent=True) or {}
-        raw_tmc = body.get("tmc") or body.get("team_code") or raw_tmc
-        raw_text = body.get("text") or raw_text
-
-    return str(raw_tmc).strip(), raw_text
-
-
-FALLBACK_HTML = '<!DOCTYPE html>\n<html lang="ar" dir="rtl">\n<head>\n  <meta charset="UTF-8" />\n  <meta name="viewport" content="width=device-width, initial-scale=1.0" />\n  <title>Ø±Ø§ÙÙÙ ÙØµÙ - Ø¥Ø¯Ø§Ø±Ø© Ø§ÙØ³ÙÙØ§Ø¯ ÙØ§ÙÙØ§ØªØ´</title>\n  <style>\n    body { font-family: Tahoma, Arial, sans-serif; background: #0d0b14; color: #f3effa; margin: 0; padding: 16px; }\n    .card { background: #171324; border: 1px solid #2b2342; border-radius: 14px; padding: 16px; margin-bottom: 14px; }\n    .btn { background: linear-gradient(135deg, #7c3aed, #5b21b6); color: #fff; border: none; padding: 12px 18px; border-radius: 10px; font-size: 15px; font-weight: bold; cursor: pointer; margin: 4px; }\n    .btn-green { background: linear-gradient(135deg, #059669, #047857); }\n    .btn-gray { background: #2c2440; }\n    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }\n    .stat { background: #110e1c; padding: 12px; border-radius: 10px; text-align: center; }\n    .acc { background: #110e1c; padding: 12px; border-radius: 10px; margin-top: 8px; display: flex; justify-content: space-between; align-items: center; }\n    .badge { padding: 4px 10px; border-radius: 999px; font-size: 12px; background: #1e3a2f; color: #34d399; }\n    .logs { background: #09070f; padding: 10px; border-radius: 10px; max-height: 240px; overflow-y: auto; font-family: monospace; font-size: 12px; direction: ltr; text-align: left; }\n    input { background: #0e0b18; color: #fff; border: 1px solid #352b52; padding: 8px 10px; border-radius: 8px; margin: 4px; }\n  </style>\n</head>\n<body>\n  <div class="card">\n    <h2>â¡ Ø±Ø§ÙÙÙ ÙØµÙ â Ø³ÙÙØ§Ø¯ 4 Ø­Ø³Ø§Ø¨Ø§Øª ÙØ¨Ø¯Ø¡ Ø§ÙÙØ§ØªØ´</h2>\n    <button id="btnSquadMatch" class="btn btn-green" onclick="startSquadMatch()">ð Ø¯Ø®ÙÙ Ø³ÙÙØ§Ø¯ ÙØ¨Ø¯Ø¡ Ø§ÙÙØ§ØªØ´ (4 Ø­Ø³Ø§Ø¨Ø§Øª)</button>\n    <button class="btn btn-gray" onclick="toggleAutoSquad()">ð ØªØ¨Ø¯ÙÙ Ø§ÙØªØ´ØºÙÙ Ø§ÙØªÙÙØ§Ø¦Ù Ø¹ÙØ¯ Ø§ÙØªÙØ§Ù 4</button>\n    <button class="btn" onclick="openAddForm()">â Ø¥Ø¶Ø§ÙØ© Ø­Ø³Ø§Ø¨</button>\n    <div id="addBox" style="display:none; margin-top:10px;">\n      <input id="inpUid" placeholder="UID" />\n      <input id="inpPass" placeholder="Password" />\n      <input id="inpRegion" value="ME" style="width:65px" />\n      <button class="btn" onclick="addAccount()">Ø­ÙØ¸ ÙØ§ØªØµØ§Ù</button>\n    </div>\n    <div id="msgBox" style="margin-top:10px; color:#a78bfa;"></div>\n  </div>\n\n  <div class="card grid">\n    <div class="stat"><div>Ø§ÙØ­Ø³Ø§Ø¨Ø§Øª Ø§ÙÙØªØµÙØ©</div><h3 id="sAccs">0</h3></div>\n    <div class="stat"><div>Ø§ÙÙØ§ØªØ´Ø§Øª Ø§ÙÙØ¨Ø¯ÙØ¡Ø©</div><h3 id="sMatches">0</h3></div>\n    <div class="stat"><div>Ø§ÙØ³ÙÙØ§Ø¯Ø§Øª Ø§ÙÙØ´Ø·Ø©</div><h3 id="sSquads">0</h3></div>\n    <div class="stat"><div>Ø§ÙØªØ´ØºÙÙ Ø§ÙØªÙÙØ§Ø¦Ù</div><h3 id="sAuto">ÙÙØ¹Ù</h3></div>\n  </div>\n\n  <div class="card">\n    <h3>Ø§ÙØ­Ø³Ø§Ø¨Ø§Øª</h3>\n    <div id="accsList"></div>\n  </div>\n\n  <div class="card">\n    <h3>Ø³Ø¬Ù Ø§ÙØ£Ø­Ø¯Ø§Ø«</h3>\n    <div id="logsBox" class="logs"></div>\n  </div>\n\n  <script>\n    function openAddForm() {\n      const el = document.getElementById("addBox");\n      el.style.display = el.style.display === "none" ? "block" : "none";\n    }\n    async function addAccount() {\n      const uid = document.getElementById("inpUid").value.trim();\n      const password = document.getElementById("inpPass").value.trim();\n      const region = document.getElementById("inpRegion").value.trim() || "ME";\n      const r = await fetch("/api/account/add", {\n        method: "POST",\n        headers: {"Content-Type": "application/json"},\n        body: JSON.stringify({uid, password, region})\n      });\n      const d = await r.json();\n      document.getElementById("msgBox").innerText = d.status === "ok" ? ("ØªÙ Ø±Ø¨Ø· Ø§ÙØ­Ø³Ø§Ø¨: " + d.nickname) : (d.error || "ÙØ´Ù Ø§ÙØ±Ø¨Ø·");\n      refreshStats();\n    }\n    async function startSquadMatch() {\n      const btn = document.getElementById("btnSquadMatch");\n      btn.disabled = true;\n      document.getElementById("msgBox").innerText = "Ø¬Ø§Ø±Ù ØªÙÙÙÙ Ø§ÙØ³ÙÙØ§Ø¯ ÙÙ 4 Ø­Ø³Ø§Ø¨Ø§Øª ÙØ¨Ø¯Ø¡ Ø§ÙÙØ§ØªØ´...";\n      try {\n        const r = await fetch("/api/squad/start", {\n          method: "POST",\n          headers: {"Content-Type": "application/json"},\n          body: JSON.stringify({auto_start_match: true})\n        });\n        const d = await r.json();\n        if (d.ok) {\n          document.getElementById("msgBox").innerText = "â ØªÙ ØªÙÙÙÙ Ø§ÙØ³ÙÙØ§Ø¯ (" + d.squad_id + ") ÙØ¨Ø¯Ø¡ Ø§ÙÙØ§ØªØ´ Ø¨ÙØ¬Ø§Ø­!";\n        } else {\n          document.getElementById("msgBox").innerText = "â ï¸ " + (d.error || "ØªØ¹Ø°Ø± Ø¨Ø¯Ø¡ Ø§ÙØ³ÙÙØ§Ø¯");\n        }\n      } catch (e) {\n        document.getElementById("msgBox").innerText = "â Ø®Ø·Ø£ ÙÙ Ø§ÙØ§ØªØµØ§Ù Ø¨Ø§ÙØ³ÙØ±ÙØ±";\n      } finally {\n        btn.disabled = false;\n        refreshStats();\n      }\n    }\n    async function toggleAutoSquad() {\n      const r = await fetch("/api/squad/auto", {method: "POST", headers: {"Content-Type": "application/json"}, body: "{}"});\n      const d = await r.json();\n      document.getElementById("msgBox").innerText = "Ø§ÙØªØ´ØºÙÙ Ø§ÙØªÙÙØ§Ø¦Ù Ø¹ÙØ¯ Ø§ÙØªÙØ§Ù 4: " + (d.auto_squad_enabled ? "ÙÙØ¹Ù" : "ÙØªÙÙÙ");\n      refreshStats();\n    }\n    async function refreshStats() {\n      const r = await fetch("/api/stats");\n      const d = await r.json();\n      document.getElementById("sAccs").innerText = d.total_accounts || 0;\n      document.getElementById("sMatches").innerText = d.total_matches_started || 0;\n      document.getElementById("sSquads").innerText = (d.squads || []).length;\n      document.getElementById("sAuto").innerText = d.auto_squad_enabled ? "ÙÙØ¹Ù" : "ÙØªÙÙÙ";\n      const list = document.getElementById("accsList");\n      list.innerHTML = (d.accounts || []).map(a =>\n        `<div class="acc"><div><b>${a.nickname}</b> (${a.uid})</div><span class="badge">${a.status}</span></div>`\n      ).join("") || "<div>ÙØ§ ØªÙØ¬Ø¯ Ø­Ø³Ø§Ø¨Ø§Øª ÙØªØµÙØ© Ø­Ø§ÙÙØ§Ù</div>";\n      const logs = document.getElementById("logsBox");\n      logs.innerHTML = (d.logs || []).slice(-60).map(l => `<div>[${l.time}] [${l.level}] ${l.message}</div>`).join("");\n      logs.scrollTop = logs.scrollHeight;\n    }\n    setInterval(refreshStats, 2500);\n    refreshStats();\n  </script>\n</body>\n</html>\n'
 
 @app.route("/", methods=["GET"])
 def index():
@@ -1519,26 +1984,15 @@ def index():
         return send_file(html_path)
     return FALLBACK_HTML, 200
 
+
 @app.route("/status_json", methods=["GET"])
-def status_json():
-    return jsonify({
-        "status": "online",
-        "accounts_loaded": len(account_pool.accounts),
-        "loading": account_pool.loading,
-        "usage": "/tmc?tmc=TEAM_CODE&text=MESSAGE",
-        "stop_usage": "/stop_spam?tmc=TEAM_CODE",
-        "DEV": DEV_NAME
-    }), 200
-
-
 @app.route("/status", methods=["GET"])
 def status():
     return jsonify({
         "status": "online",
+        "mode": "level_up_solo",
         "accounts_loaded": len(account_pool.accounts),
         "loading": account_pool.loading,
-        "usage": "/tmc?tmc=TEAM_CODE&text=MESSAGE",
-        "stop_usage": "/stop_spam?tmc=TEAM_CODE",
         "DEV": DEV_NAME
     }), 200
 
@@ -1556,6 +2010,7 @@ def api_stats():
         logs_copy = list(ui_logs)
     return jsonify({
         "ok": True,
+        "mode": "level_up_solo",
         "total_accounts": len(accs),
         "total_matches_started": total_started,
         "total_matches": total_done,
@@ -1565,8 +2020,7 @@ def api_stats():
         "uptime": int(uptime_sec),
         "accounts": accs,
         "logs": logs_copy,
-        "squads": list(squad_manager.active_squads.values()),
-        "auto_squad_enabled": squad_manager.auto_squad_enabled,
+        "auto_match_enabled": levelup_manager.auto_match_enabled,
         "DEV": DEV_NAME,
     }), 200
 
@@ -1650,8 +2104,8 @@ def api_create_team():
     password = str(body.get("password") or "RAFIN TxT").strip() or "RAFIN TxT"
     if not clan_id:
         return jsonify({"ok": False, "error": "Clan ID is required"}), 400
-    async_loop.start_background(_create_team_worker(region, clan_id, count, password))
-    return jsonify({"ok": True, "region": region, "clan_id": clan_id, "count": count}), 200
+    async_loop.start_background(_create_levelup_worker(region, clan_id, count, password))
+    return jsonify({"ok": True, "region": region, "clan_id": clan_id, "count": count, "mode": "level_up_solo"}), 200
 
 
 @app.route("/api/logs/clear", methods=["POST"])
@@ -1661,68 +2115,13 @@ def api_logs_clear():
     return jsonify({"ok": True}), 200
 
 
-@app.route("/tmc", methods=["GET", "POST"])
-@app.route("/tmc=<path:rest>", methods=["GET", "POST"])
-def tmc_route(rest=None):
-    team_code, text = _parse_tmc_request()
-    try:
-        ok, msg = async_loop.run(run_tmc_spam(team_code, text, interval=1.1))
-        return jsonify({
-            "success": ok,
-            "message": msg,
-            "team_code": team_code,
-            "DEV": DEV_NAME
-        }), (200 if ok else 400)
-    except Exception:
-        log.exception("tmc_route error")
-        return jsonify({
-            "success": False,
-            "message": "Internal server error",
-            "team_code": team_code,
-            "DEV": DEV_NAME
-        }), 500
-
-
-@app.route("/stop_spam", methods=["GET", "POST"])
-def stop_spam():
-    code = str(
-        request.args.get("tmc")
-        or request.args.get("team_code")
-        or (request.get_json(silent=True) or {}).get("tmc")
-        or ""
-    ).strip()
-
-    if code:
-        t = spam_tasks.pop(code, None)
-        if t and not t.done():
-            t.cancel()
-        return jsonify({"success": True, "message": f"Stopped spam for {code}", "DEV": DEV_NAME}), 200
-
-    for t in list(spam_tasks.values()):
-        if not t.done():
-            t.cancel()
-    spam_tasks.clear()
-    return jsonify({"success": True, "message": "Stopped all spam loops", "DEV": DEV_NAME}), 200
-
-
-
-@app.route("/api/squad/start", methods=["GET", "POST"])
-@app.route("/api/squad/create", methods=["GET", "POST"])
-@app.route("/api/squad/match", methods=["GET", "POST"])
-@app.route("/api/start_squad", methods=["GET", "POST"])
-def api_squad_start():
+@app.route("/api/match/start", methods=["GET", "POST"])
+@app.route("/api/levelup/start", methods=["GET", "POST"])
+def api_match_start():
     body = request.get_json(silent=True) or {}
-    team_code = str(
-        body.get("team_code")
-        or body.get("tmc")
-        or request.args.get("team_code")
-        or request.args.get("tmc")
-        or ""
-    ).strip()
-    auto_match_raw = body.get("auto_start_match", request.args.get("auto_start_match", True))
-    auto_start_match = str(auto_match_raw).lower() not in ("0", "false", "no", "off")
+    target_uid = str(body.get("uid") or request.args.get("uid") or "").strip()
     result = async_loop.run(
-        squad_manager.form_squad_and_start_match(team_code=team_code, auto_start_match=auto_start_match),
+        levelup_manager.start_matches_for_accounts(target_uid=target_uid),
         timeout=25
     )
     status_code = 200 if result.get("ok") else 400
@@ -1730,28 +2129,18 @@ def api_squad_start():
     return jsonify(result), status_code
 
 
-@app.route("/api/squad/auto", methods=["POST"])
-def api_squad_auto():
+@app.route("/api/match/auto", methods=["POST"])
+def api_match_auto():
     body = request.get_json(silent=True) or {}
     if "enabled" in body:
-        squad_manager.auto_squad_enabled = bool(body["enabled"])
+        levelup_manager.auto_match_enabled = bool(body["enabled"])
     else:
-        squad_manager.auto_squad_enabled = not squad_manager.auto_squad_enabled
+        levelup_manager.auto_match_enabled = not levelup_manager.auto_match_enabled
     push_log(
-        f"Auto 4-account squad & match: {'ENABLED' if squad_manager.auto_squad_enabled else 'DISABLED'}",
+        f"Auto Level-Up solo match: {'ENABLED' if levelup_manager.auto_match_enabled else 'DISABLED'}",
         "info"
     )
-    return jsonify({"ok": True, "auto_squad_enabled": squad_manager.auto_squad_enabled, "DEV": DEV_NAME}), 200
-
-
-@app.route("/api/squads", methods=["GET"])
-def api_squads():
-    return jsonify({
-        "ok": True,
-        "auto_squad_enabled": squad_manager.auto_squad_enabled,
-        "squads": list(squad_manager.active_squads.values()),
-        "DEV": DEV_NAME,
-    }), 200
+    return jsonify({"ok": True, "auto_match_enabled": levelup_manager.auto_match_enabled, "DEV": DEV_NAME}), 200
 
 
 if __name__ == "__main__":
