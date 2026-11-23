@@ -5,13 +5,15 @@ import json
 import time
 import uuid
 import socket
+import random
 import struct
 import asyncio
 import logging
-import threading
 import itertools
+import threading
 from datetime import datetime
 from urllib.parse import unquote
+from typing import Dict, List, Optional, Tuple, Any
 
 import httpx
 from flask import Flask, request, jsonify, send_file
@@ -20,14 +22,21 @@ from protobuf_decoder.protobuf_decoder import Parser
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
 from Pb2 import MajoRLoGinrEs_pb2, MajoRLoGinrEq_pb2, PorTs_pb2
+
+try:
+    from message_ids import MESSAGE_ID_TO_NAME
+except Exception:
+    MESSAGE_ID_TO_NAME = {
+        1: "UDP_HELLO",
+        2: "UDP_ACK",
+        3: "UDP_PING",
+        101: "RUDP_JOIN_MATCH",
+    }
+
 try:
     import thunderFF_pb2
 except Exception:
     thunderFF_pb2 = None
-try:
-    from message_ids import MESSAGE_ID_TO_NAME
-except Exception:
-    MESSAGE_ID_TO_NAME = {}
 
 DEV_NAME = "JAGWAR x STRAVEX"
 START_TIME = time.time()
@@ -38,14 +47,42 @@ log = logging.getLogger("jagwar")
 AES_KEY = b'Yg&tc%DEuh6%Zc^8'
 AES_IV = b'6oyZDr22E3ychjM%'
 
-# Level-Up / Solo Match configuration & constants extracted from Level-Up code
+REGION_LANG = {
+    "BD": "bn", "IND": "hi", "PK": "ur", "SG": "en", "ID": "id",
+    "ME": "ar", "VN": "vi", "TW": "zh", "CIS": "ru", "TH": "th",
+    "EU": "en", "US": "en", "SAC": "es", "LK": "en", "BR": "pt",
+    "RU": "ru", "NA": "en"
+}
+
+DEFAULT_HEADERS = {
+    'User-Agent': 'UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)',
+    'Connection': 'Keep-Alive',
+    'Accept-Encoding': 'gzip',
+    'Content-Type': 'application/x-www-form-urlencoded',
+    'Expect': '100-continue',
+    'X-Unity-Version': '2018.4.12f1',
+    'X-GA-SV': '1789535859',
+    'X-GA': 'v1 1',
+    'ReleaseVersion': 'OB55',
+}
+
+# ==================== LEVEL-UP & MATCH CONSTANTS (EXTRACTED) ====================
+TOKEN_CACHE_FILE = "token_cache.json"
+DEVICES_FILE = "devices.json"
+TOKEN_CACHE_TTL = 1200
+
 START_MATCH_INTERVAL = 3.0
 NEW_MATCH_DELAY = 3.0
 MAX_MATCH_DURATION = 700
 MATCH_IDLE_TIMEOUT = 8.0
 PRIORITY_REGIONS = ["BD", "IND", "SG", "TH", "PH", "VN", "MY", "ID", "HK", "TW"]
-MAX_CONSECUTIVE_PARSE_FAILURES = 5.0
+MAX_CONSECUTIVE_PARSE_FAILURES = 5
 NON_MATCH_RECONNECT_DELAY = 1.0
+
+CLOUDFLARE_PRIMARY_DNS = "1.1.1.1"
+CLOUDFLARE_SECONDARY_DNS = "1.0.0.1"
+_DNS_CACHE: Dict[str, Tuple[str, float]] = {}
+_DNS_CACHE_TTL = 300.0
 
 CRC7_TABLE = bytes([
     0, 9, 18, 27, 36, 45, 54, 63, 72, 65, 90, 83, 108, 101, 126, 119,
@@ -71,36 +108,186 @@ _ROUNDS = 16
 _FIELD_SIZES = {0: 1, 1: 2, 2: 2, 3: 1, 4: 2}
 _FIELD_NAMES = {0: "sendOption", 1: "cmd", 2: "orderId", 3: "flags", 4: "length"}
 
-# ==================== CLOUDFLARE DNS & SOCKET OPTIMIZERS (FROM LEVEL-UP) ====================
-CLOUDFLARE_PRIMARY_DNS = "1.1.1.1"
-CLOUDFLARE_SECONDARY_DNS = "1.0.0.1"
-_DNS_CACHE = {}
-_DNS_CACHE_TTL = 300.0
+ui_logs = []
+ui_logs_lock = threading.Lock()
+matches_started_total = 0
+matches_completed_total = 0
+all_paused_flag = False
 
 
+def push_log(message, level="info"):
+    ts = datetime.now().strftime("%H:%M:%S")
+    entry = {"time": ts, "level": level, "message": str(message)}
+    with ui_logs_lock:
+        ui_logs.append(entry)
+        if len(ui_logs) > 500:
+            del ui_logs[:-500]
+    if level == "error":
+        log.error(message)
+    elif level == "warning":
+        log.warning(message)
+    else:
+        log.info(message)
+
+
+# ==================== PERSISTENT DEVICE & TOKEN CACHE (EXTRACTED) ====================
+def get_device_for_account(account_identifier: str) -> dict:
+    devices = {}
+    if os.path.exists(DEVICES_FILE):
+        try:
+            with open(DEVICES_FILE, "r", encoding="utf-8") as f:
+                devices = json.load(f)
+        except Exception:
+            pass
+
+    acc_key = str(account_identifier)
+    if acc_key in devices:
+        return devices[acc_key]
+
+    device_list = [
+        ("Samsung", "SM-G998B", "Adreno (TM) 660", "Android OS 12 / API-31"),
+        ("Xiaomi", "2201122G", "Adreno (TM) 730", "Android OS 13 / API-33"),
+        ("Realme", "RMX3700", "Mali-G710", "Android OS 14 / API-34"),
+        ("OnePlus", "CPH2451", "Adreno (TM) 740", "Android OS 13 / API-33"),
+        ("OPPO", "CPH2611", "Adreno (TM) 720", "Android OS 14 / API-34"),
+        ("Vivo", "V2203", "Mali-G710", "Android OS 12 / API-31"),
+        ("Poco", "M2102J20SG", "Adreno (TM) 660", "Android OS 13 / API-33"),
+    ]
+    brand, model, gpu, os_ver = random.choice(device_list)
+
+    new_device = {
+        "unique_device_id": f"Google|{str(uuid.uuid4())}",
+        "brand": brand,
+        "model": model,
+        "gpu_renderer": gpu,
+        "system_software": os_ver,
+        "screen_width": random.choice([1080, 1440, 720, 1280]),
+        "screen_height": random.choice([2400, 3200, 1600, 2400]),
+        "screen_dpi": str(random.randint(300, 420)),
+        "memory": random.randint(2800, 6500),
+        "processor_details": f"ARM64 FP ASIMD AES VMH | {random.randint(2200, 3200)} | {random.randint(6, 12)}",
+        "client_ip": f"{random.randint(103, 223)}.{random.randint(10, 250)}.{random.randint(10, 250)}.{random.randint(10, 250)}"
+    }
+    devices[acc_key] = new_device
+    try:
+        with open(DEVICES_FILE, "w", encoding="utf-8") as f:
+            json.dump(devices, f, indent=4)
+    except Exception as e:
+        push_log(f"Failed to save device mapping: {e}", "error")
+    return new_device
+
+
+_token_cache_memo: Dict[str, Any] = {}
+_token_cache_memo_time: float = 0.0
+_TOKEN_CACHE_MEMO_TTL = 5.0
+
+
+def _json_serializer(obj):
+    if isinstance(obj, (bytes, bytearray)):
+        return {"__bytes_hex__": bytes(obj).hex()}
+    raise TypeError(f"Type {type(obj)} not serializable")
+
+
+def _json_deserializer(obj):
+    if isinstance(obj, dict):
+        if "__bytes_hex__" in obj and len(obj) == 1:
+            try:
+                return bytes.fromhex(obj["__bytes_hex__"])
+            except Exception:
+                return b""
+        return {k: _json_deserializer(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_json_deserializer(x) for x in obj]
+    return obj
+
+
+def _load_token_cache() -> Dict[str, Any]:
+    global _token_cache_memo, _token_cache_memo_time
+    now = time.time()
+    if _token_cache_memo and (now - _token_cache_memo_time) < _TOKEN_CACHE_MEMO_TTL:
+        return _token_cache_memo
+    if not os.path.exists(TOKEN_CACHE_FILE):
+        return {}
+    try:
+        with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+        if not content:
+            return {}
+        data = json.loads(content)
+        parsed = _json_deserializer(data)
+        _token_cache_memo = parsed
+        _token_cache_memo_time = now
+        return parsed
+    except Exception:
+        return {}
+
+
+def _save_token_cache(cache: Dict[str, Any]):
+    global _token_cache_memo, _token_cache_memo_time
+    try:
+        tmp_file = TOKEN_CACHE_FILE + ".tmp"
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(cache, f, indent=2, default=_json_serializer)
+        os.replace(tmp_file, TOKEN_CACHE_FILE)
+        _token_cache_memo = cache
+        _token_cache_memo_time = time.time()
+    except Exception as e:
+        push_log(f"Token cache save error: {e}", "error")
+
+
+def cache_get(uid: str) -> Optional[Dict]:
+    cache = _load_token_cache()
+    entry = cache.get(str(uid))
+    if not entry:
+        return None
+    if time.time() - entry.get("cached_at", 0) > TOKEN_CACHE_TTL:
+        cache_invalidate(uid)
+        return None
+    return entry
+
+
+def cache_set(uid: str, account_data: Dict):
+    cache = _load_token_cache()
+    entry = dict(account_data)
+    entry["cached_at"] = time.time()
+    cache[str(uid)] = entry
+    _save_token_cache(cache)
+
+
+def cache_invalidate(uid: str):
+    cache = _load_token_cache()
+    if str(uid) in cache:
+        del cache[str(uid)]
+        _save_token_cache(cache)
+
+
+# ==================== DNS & SOCKET OPTIMIZERS (EXTRACTED) ====================
 async def resolve_host_cloudflare(hostname: str) -> str:
     if not hostname:
         return hostname
     parts = hostname.split('.')
     if len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
         return hostname
+
     now = time.time()
     if hostname in _DNS_CACHE:
         ip, exp = _DNS_CACHE[hostname]
         if now < exp:
             return ip
 
-    def _query_cloudflare(server_ip: str):
+    def _query_cloudflare(server_ip: str) -> Optional[str]:
         s = None
         try:
             tx_id = random.randint(1000, 65535)
             header = struct.pack(">HHHHHH", tx_id, 0x0100, 1, 0, 0, 0)
             qname = b"".join(bytes([len(part)]) + part.encode('ascii') for part in hostname.split('.')) + b"\x00"
             query_pkt = header + qname + struct.pack(">HH", 1, 1)
+
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.settimeout(1.2)
             s.sendto(query_pkt, (server_ip, 53))
             resp, _ = s.recvfrom(1024)
+
             if len(resp) >= 12:
                 ancount = struct.unpack(">H", resp[6:8])[0]
                 if ancount > 0:
@@ -142,6 +329,7 @@ async def resolve_host_cloudflare(hostname: str) -> str:
                 ip = ip_info[0][4][0]
         except Exception:
             ip = hostname
+
     if ip:
         _DNS_CACHE[hostname] = (ip, now + _DNS_CACHE_TTL)
     return ip or hostname
@@ -170,7 +358,7 @@ def optimize_udp_socket(sock: socket.socket):
         pass
 
 
-# ==================== LEVEL-UP UDP / TEA / PROTOBUF MATCH HELPERS ====================
+# ==================== LEVEL-UP UDP / TEA / CRC7 HELPERS (EXTRACTED) ====================
 async def has_ssan_zig(n):
     z = (n << 1) & 0xFFFFFFFFFFFFFFFF
     out = bytearray()
@@ -304,8 +492,8 @@ async def sv_frame(msg_key, layout, send_option, cmd, order_id, flags, content, 
 
 
 async def build_match_startup_packets(token, udp_key, match_code, account_id, block_val,
-                                      server_ip="", region="BD", client_version="1.134.21",
-                                      client_version_code="2019121269", access_token=""):
+                                      server_ip="", region="BD", client_version="1.132.6",
+                                      client_version_code="2019121229", access_token=""):
     token = token.strip()
     udp_key = bytes.fromhex(udp_key)
     match_code = [int(ch) for ch in str(match_code).strip()]
@@ -316,6 +504,7 @@ async def build_match_startup_packets(token, udp_key, match_code, account_id, bl
     encoded_sharma_jwt = sharma_jwt.encode() if isinstance(sharma_jwt, str) else sharma_jwt
 
     garena420 = await has_ssan_zig(len(encoded_thunder_jwt)) + encoded_thunder_jwt
+
     reg = str(region).upper() if region else "BD"
     csoversea_block = bytes.fromhex(
         "ca0163736f7665727365612e7374726f6e67686f6c642e66726565666972656d6f62696c652e636f6d"
@@ -500,9 +689,7 @@ async def decode_packet(packet, key, mask=None):
         layouts += [("nonRUDP", list(p)) for p in itertools.permutations([0, 1, 3, 4])]
     for kind, layout in layouts:
         f = await try_header(data, layout, k, v80)
-        if not f:
-            continue
-        if f["flags"] > 7 or f["sendOption"] > 7:
+        if not f or f["flags"] > 7 or f["sendOption"] > 7:
             continue
         if f["length"] != len(data) - f["headerLen"]:
             continue
@@ -532,342 +719,17 @@ async def decode_packet(packet, key, mask=None):
     return candidates[0]
 
 
-async def start_solo_match_packet(region, client_version, writer, key, iv):
-    """Sends solo match start packet directly for a single account without forming a squad."""
-    base_hex = (
-        "080112800a0a010b102b3a110a044944433110aa011a064555524f50453a100a044944433210311a064555524f504540014a0801090a0b1219202758016291090a80013038384638324246303241393637363730323031303130303030303030303030303031363030303130303135303030323232463937454545304630303030303034363736323531343030303030303030303030303030303030303030303030303030303030303030303030303066663030303030303030636163666131366410241afb02735d5e571400024a775d45414d1a041b1c001f11010449715f4243481a001e1d071c1703004b1a4066785c524570735c51486775421b5c5a4c07504042685a63610816054e19025e75196001477c015165406370195f5547404e4550640103020f1304064863754268676c755f65576e40467e5f0a417a4701026d675d6e73670b1108495a4c6a0b78470b740065645e525a057258425f584a447d4e6759440c11044e7c596d7f4b625f7d04055a47505c4e1d6b5b4107447d7201057d7f0f14084e430457674f7e517d72015172415d027473577c4d615f79535256780911030f4d5e027a797f614165067806505d53777750475e75064257076500460817014e741e7e5078487e7a7c465e7669767153497064605a7376677773550d160148037e18675966787f4c42607a645f577e7b441b460776026b18685d0b110205490060020f70676175654674706671797f41067346677c4e06585e780f15074c57047b40517075415f6364027259674b5b0166407f7340600407770a22047a5d5c52300b3a0a167305067162727516134208312e3133302e3232480350015ae90403626253513635686e556f4e36416456324b796f566c636f477776484f624e56526c4d727073504b4f43654177616848494176795556497273743752737149734a7a786b3247525268377a2f637664626d504f6a73552f79626d38547a4c69586d2f474351696d494b53486833447955726f39515152756c34545350626d6d624b7949565937545671577059455372323646572f59624578507338514f706d317372785455736c30796a434144444d4f34616a654b615753366361496c554b4963797a494e396d52516f715277687939797257476d337a644345337a6a61436f492f5a585233656f65365a42647a64677654636b6b665733356e4d4c6a6a565072564b6433523172756174394e50514150724a5546627859696c4c5a3859707336654d5447666b6649793574666a526c314d4648706b51774c6373374439656378566c41636f374e664f6d2b30654756466c4434744478706771385533595973587645384842502f70666c767a737138316a32524f4d7857437556445442492f684735625462773166456e4249725162762b636144775147696f74554e316d4c4b77734379456f4766706746614251457645672b736a764c4c78704743334c304a5344532f74526169504354553344374e6249306547516651622f5a466f4c36455630775a324d6f583932414c572f5049752f56634663584e70596b356f7966326151416a536971486a2f363276354843644f525551303578754e6171795251625653704654303137655237675255636b4966366c6f447476342b514e4a4670766d74757077707774396a5a5974437a4b56743657726d6e36785837706658456251555434684f3758a201050803108703a201050804108103a20105080510c001a20105081d10cc01a2010408161078a20105080e10af01a201020815"
-    )
-    raw_bytes = bytes.fromhex(base_hex)
-    if thunderFF_pb2 is not None and hasattr(thunderFF_pb2, "StartMatch"):
-        try:
-            proto = thunderFF_pb2.StartMatch()
-            proto.ParseFromString(raw_bytes)
-            if hasattr(proto.main, 'region_list') and len(proto.main.region_list) > 0:
-                proto.main.region_list[0].region = region
-                if len(proto.main.region_list) > 1:
-                    proto.main.region_list[1].region = region
-            if hasattr(proto.main, 'client_version'):
-                proto.main.client_version.remote_version = client_version
-            raw_bytes = proto.SerializeToString()
-        except Exception:
-            pass
-
-    enc_hex = AES.new(key, AES.MODE_CBC, iv).encrypt(pad(raw_bytes, AES.block_size)).hex()
-    pkt_len = len(enc_hex) // 2
-    hex_len = hex(pkt_len)[2:]
-    if len(hex_len) < 2:
-        hex_len = "0" + hex_len
-    final_hex = "031400" + "0" * (6 - len(hex_len)) + hex_len + enc_hex
-    writer.write(bytes.fromhex(final_hex))
-    await writer.drain()
+async def send_keep_alive(region="BD"):
+    reg = str(region).upper() if region else "BD"
+    ka_hex = "0219" if reg == "BD" else ("0214" if reg == "IND" else "0215")
+    return bytes.fromhex(ka_hex)
 
 
-REGION_LANG = {
-    "BD": "bn", "IND": "hi", "PK": "ur", "SG": "en", "ID": "id",
-    "ME": "ar", "VN": "vi", "TW": "zh", "CIS": "ru", "TH": "th",
-    "EU": "en", "US": "en", "SAC": "es", "LK": "en", "BR": "pt",
-    "RU": "ru", "NA": "en"
-}
-
-DEFAULT_HEADERS = {
-    'User-Agent': 'UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)',
-    'Connection': 'Keep-Alive',
-    'Accept-Encoding': 'gzip',
-    'Content-Type': 'application/x-www-form-urlencoded',
-    'Expect': '100-continue',
-    'X-Unity-Version': '2018.4.12f1',
-    'X-GA-SV': '1789535859',
-    'X-GA': 'v1 1',
-    'ReleaseVersion': 'OB55',
-}
-
-ui_logs = []
-ui_logs_lock = threading.Lock()
-matches_started_total = 0
-matches_completed_total = 0
-all_paused_flag = False
+async def aes_encrypt(payload, key, iv):
+    return AES.new(key, AES.MODE_CBC, iv).encrypt(pad(payload, AES.block_size))
 
 
-def push_log(message, level="info"):
-    ts = datetime.now().strftime("%H:%M:%S")
-    entry = {"time": ts, "level": level, "message": str(message)}
-    with ui_logs_lock:
-        ui_logs.append(entry)
-        if len(ui_logs) > 500:
-            del ui_logs[:-500]
-    if level == "error":
-        log.error(message)
-    elif level == "warning":
-        log.warning(message)
-    else:
-        log.info(message)
-
-
-def HELLXenc_packet(payload, key, iv):
-    raw = bytes.fromhex(payload) if isinstance(payload, str) else bytes(payload)
-    if isinstance(key, str):
-        key = bytes.fromhex(key)
-    if isinstance(iv, str):
-        iv = bytes.fromhex(iv)
-    return AES.new(key, AES.MODE_CBC, iv).encrypt(pad(raw, 16)).hex()
-
-
-def HELLXdec_packet(payload, key, iv):
-    raw = bytes.fromhex(payload) if isinstance(payload, str) else bytes(payload)
-    if isinstance(key, str):
-        key = bytes.fromhex(key)
-    if isinstance(iv, str):
-        iv = bytes.fromhex(iv)
-    return unpad(AES.new(key, AES.MODE_CBC, iv).decrypt(raw), 16).hex()
-
-
-def HELLXenc_varint(n):
-    if n < 0:
-        return b''
-    h = []
-    while True:
-        b = n & 0x7F
-        n >>= 7
-        if n:
-            b |= 0x80
-        h.append(b)
-        if not n:
-            break
-    return bytes(h)
-
-
-def HELLXdec_varint(data, pos):
-    res, shift = 0, 0
-    while pos < len(data):
-        b = data[pos]
-        res |= (b & 0x7F) << shift
-        pos += 1
-        if not (b & 0x80):
-            return res, pos
-        shift += 7
-    return 0, pos
-
-
-def HELLXcreate_variant(f, v):
-    return HELLXenc_varint((f << 3) | 0) + HELLXenc_varint(v)
-
-
-def HELLXcreate_length(f, v):
-    ev = v.encode('utf-8') if isinstance(v, str) else v
-    return HELLXenc_varint((f << 3) | 2) + HELLXenc_varint(len(ev)) + ev
-
-
-def HELLXcreate_proto(fields):
-    packet = bytearray()
-    for f, v in fields.items():
-        if isinstance(v, list):
-            for it in v:
-                if isinstance(it, dict):
-                    packet.extend(HELLXcreate_length(f, HELLXcreate_proto(it)))
-                elif isinstance(it, int):
-                    packet.extend(HELLXcreate_variant(f, it))
-                elif isinstance(it, (str, bytes)):
-                    packet.extend(HELLXcreate_length(f, it))
-        elif isinstance(v, dict):
-            packet.extend(HELLXcreate_length(f, HELLXcreate_proto(v)))
-        elif isinstance(v, int):
-            packet.extend(HELLXcreate_variant(f, v))
-        elif isinstance(v, (str, bytes)):
-            packet.extend(HELLXcreate_length(f, v))
-    return bytes(packet)
-
-
-def HELLXdecode_proto(data):
-    res_d, pos = {}, 0
-    while pos < len(data):
-        try:
-            tag, pos = HELLXdec_varint(data, pos)
-            if tag == 0:
-                break
-            fn, wt = tag >> 3, tag & 0x07
-            key, val = str(fn), None
-            if wt == 0:
-                val, pos = HELLXdec_varint(data, pos)
-            elif wt == 1:
-                val = data[pos:pos + 8].hex()
-                pos += 8
-            elif wt == 2:
-                length, pos = HELLXdec_varint(data, pos)
-                chunk = data[pos:pos + length]
-                pos += length
-                try:
-                    s = chunk.decode('utf-8')
-                    if all(32 <= ord(c) <= 126 or ord(c) > 160 for c in s):
-                        val = s.strip()
-                    else:
-                        raise Exception
-                except Exception:
-                    inner = HELLXdecode_proto(chunk)
-                    val = inner if inner else chunk.hex()
-            elif wt == 5:
-                val = data[pos:pos + 4].hex()
-                pos += 4
-            else:
-                pos += 1
-                continue
-            if val is not None:
-                if key in res_d:
-                    if not isinstance(res_d[key], list):
-                        res_d[key] = [res_d[key]]
-                    res_d[key].append(val)
-                else:
-                    res_d[key] = val
-        except Exception:
-            break
-    return res_d
-
-
-def HELLXgenerate_packet(proto_hex, opcode, key, iv):
-    ep = HELLXenc_packet(proto_hex, key, iv)
-    lh = hex(len(ep) // 2)[2:].zfill(2)
-    if len(lh) == 2:
-        header = opcode + "000000" + lh
-    elif len(lh) == 3:
-        header = opcode + "00000" + lh
-    elif len(lh) == 4:
-        header = opcode + "0000" + lh
-    elif len(lh) == 5:
-        header = opcode + "000" + lh
-    else:
-        header = opcode + lh
-    return bytes.fromhex(header + ep)
-
-
-def HELLXbuild_auth_startup(uid, token, timestamp, key, iv):
-    uid_hex = hex(int(uid))[2:]
-    ul = len(uid_hex)
-    f = str(hex(timestamp))[2:]
-    if len(f) == 1:
-        f = "0" + f
-    enc_tok = HELLXenc_packet(token.encode().hex(), key, iv)
-    len_hex = hex(len(enc_tok) // 2)[2:].zfill(4)
-    headers = {9: '0000000', 8: '00000000', 10: '000000', 7: '000000000'}.get(ul, '0000000')
-    return f"0115{headers}{uid_hex}{f}0000{len_hex}{enc_tok}"
-
-
-def HELLXbuild_chat_auth(uid, region_id, key, iv):
-    fields = {1: 3, 2: {1: int(uid), 3: 'en', 4: str(region_id)}}
-    return HELLXgenerate_packet(HELLXcreate_proto(fields).hex(), '1215', key, iv)
-
-
-def get_randm_avatar():
-    return random.choice([
-        902000068, 902000016, 902000011, 902000084,
-        902000085, 902000087, 902000106, 902045016
-    ])
-
-
-async def HELLXbuild_chat_message(uid, owner_uid, message, timestamp, key, iv, name="Bot"):
-    fields = {
-        1: 1,
-        2: {
-            1: uid,
-            2: owner_uid,
-            4: message,
-            5: timestamp,
-            7: 6,
-            9: {
-                1: name,
-                2: get_randm_avatar(),
-                3: 901000029,
-                4: 330,
-                5: 801043518,
-                7: 2,
-                10: 1,
-                12: 0,
-                13: {1: 2},
-                14: {
-                    1: uid,
-                    2: 8,
-                    3: "\u0010\u0015\b\n\u000b\u0013\f\u000f\u0011\u0004\u0007\u0002\u0003\r\u000e\u0012\u0001\u0005\u0006"
-                }
-            },
-            10: "en",
-            13: {3: 1},
-            14: ""
-        }
-    }
-    return HELLXgenerate_packet(HELLXcreate_proto(fields).hex(), '1215', key, iv)
-
-
-async def EnC_PacKeT(HeX, K, V):
-    return AES.new(K, AES.MODE_CBC, V).encrypt(pad(bytes.fromhex(HeX), 16)).hex()
-
-
-async def EnC_Vr(N):
-    if N < 0:
-        return b''
-    H = []
-    while True:
-        B = N & 0x7F
-        N >>= 7
-        if N:
-            B |= 0x80
-        H.append(B)
-        if not N:
-            break
-    return bytes(H)
-
-
-async def CrEaTe_VarianT(f, v):
-    return await EnC_Vr((f << 3) | 0) + await EnC_Vr(v)
-
-
-async def CrEaTe_LenGTh(f, v):
-    ev = v.encode() if isinstance(v, str) else v
-    return await EnC_Vr((f << 3) | 2) + await EnC_Vr(len(ev)) + ev
-
-
-async def CrEaTe_ProTo(fields):
-    packet = bytearray()
-    for f, v in fields.items():
-        if isinstance(v, dict):
-            packet.extend(await CrEaTe_LenGTh(f, await CrEaTe_ProTo(v)))
-        elif isinstance(v, int):
-            packet.extend(await CrEaTe_VarianT(f, v))
-        elif isinstance(v, (str, bytes)):
-            packet.extend(await CrEaTe_LenGTh(f, v))
-    return packet
-
-
-async def GeneRaTePk(Pk, N, K, V):
-    PkEnc = await EnC_PacKeT(Pk, K, V)
-    lh = hex(len(PkEnc) // 2)[2:]
-    if len(lh) == 2:
-        H = N + "000000"
-    elif len(lh) == 3:
-        H = N + "00000"
-    elif len(lh) == 4:
-        H = N + "0000"
-    elif len(lh) == 5:
-        H = N + "000"
-    else:
-        raise ValueError("Failed")
-    return bytes.fromhex(H + lh + PkEnc)
-
-
-async def ExiT(idT, K, V):
-    fields = {1: 7, 2: {1: idT}}
-    return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex(), '0515', K, V)
-
-
-def build_ob55_online_auth(account_uid, token, kts, key, iv):
-    enc_token = AES.new(key, AES.MODE_CBC, iv).encrypt(pad(token.encode("utf-8"), 16))
-    return (
-        bytes.fromhex("830c")
-        + int(account_uid).to_bytes(8, "big")
-        + int(kts).to_bytes(4, "big")
-        + len(enc_token).to_bytes(8, "big")
-        + enc_token,
-        enc_token
-    )
-
-
+# ==================== LOGIN FUNCTIONS (PRESERVED UNCHANGED) ====================
 def _pb_varint(n):
     if n < 0:
         n = (1 << 64) + n
@@ -899,10 +761,6 @@ def _pb_field(f, v):
         d = bytes(v)
         return _pb_tag(f, 2) + _pb_varint(len(d)) + d
     return b""
-
-
-async def aes_encrypt(payload, key, iv):
-    return AES.new(key, AES.MODE_CBC, iv).encrypt(pad(payload, AES.block_size))
 
 
 def get_proto_field(d, key, default=None):
@@ -1214,12 +1072,12 @@ async def do_login(uid, password, region_pref="ME", token_override=None):
             exp_int = int(exp_val)
         except Exception:
             exp_int = 0
-        return {
+        get_device_for_account(str(uid))
+        result_dict = {
             "auth_uid": str(uid),
             "bot_uid": str(major_res.account_uid),
-            "token": major_res.token,
             "access_token": access_token,
-            "client_version": client_version,
+            "token": major_res.token,
             "region": major_res.region or region_pref,
             "key": major_res.key or AES_KEY,
             "iv": major_res.iv or AES_IV,
@@ -1232,24 +1090,240 @@ async def do_login(uid, password, region_pref="ME", token_override=None):
             "clan_id": res_proto.Clan_ID or 0,
             "clan_data": res_proto.Clan_Compiled_Data or "",
             "server_url": major_res.url,
+            "client_version": str(client_version or "1.134.21"),
             "level": level_int,
             "exp": exp_int,
             "login_data_raw": None,
         }
+        cache_set(str(uid), result_dict)
+        return result_dict
 
 
+# ==================== LEVEL-UP UDP MATCH & LONE WOLF ENGINE (EXTRACTED) ====================
+async def start_game_lone_wolf(region, client_version, writer, key, iv):
+    raw_pkt = bytes.fromhex(
+        "080112800a0a010b102b3a110a044944433110aa011a064555524f50453a100a044944433210311a064555524f504540014a0801090a0b1219202758016291090a8001303838463832424630324139363736373032303130313030303030303030303030303136303030313030313530303032323246393745454530463030303030303436373632353134303030303030303030303030303030303030303030303030303030303030303030303030303066663030303030303030636163666131366410241afb02735d5e571400024a775d45414d1a041b1c001f11010449715f4243481a001e1d071c1703004b1a4066785c524570735c51486775421b5c5a4c07504042685a63610816054e19025e75196001477c015165406370195f5547404e4550640103020f1304064863754268676c755f65576e40467e5f0a417a4701026d675d6e73670b1108495a4c6a0b78470b740065645e525a057258425f584a447d4e6759440c11044e7c596d7f4b625f7d04055a47505c4e1d6b5b4107447d7201057d7f0f14084e430457674f7e517d72015172415d027473577c4d615f79535256780911030f4d5e027a797f614165067806505d53777750475e75064257076500460817014e741e7e5078487e7a7c465e7669767153497064605a7376677773550d160148037e18675966787f4c42607a645f577e7b441b460776026b18685d0b110205490060020f70676175654674706671797f41067346677c4e06585e780f15074c57047b40517075415f6364027259674b5b0166407f7340600407770a22047a5d5c52300b3a0a167305067162727516134208312e3133302e3232480350015ae90403626253513635686e556f4e36416456324b796f566c636f477776484f624e56526c4d727073504b4f43654177616848494176795556497273743752737149734a7a786b3247525268377a2f637664626d504f6a73552f79626d38547a4c69586d2f474351696d494b53486833447955726f39515152756c34545350626d6d624b7949565937545671577059455372323646572f59624578507338514f706d317372785455736c30796a434144444d4f34616a654b615753366361496c554b4963797a494e396d52516f715277687939797257476d337a644345337a6a61436f492f5a585233656f65365a42647a64677654636b6b665733356e4d4c6a6a565072564b6433523172756174394e50514150724a5546627859696c4c5a3859707336654d5447666b6649793574666a526c314d4648706b51774c6373374439656378566c41636f374e664f6d2b30654756466c4434744478706771385533595973587645384842502f70666c767a737138316a32524f4d7857437556445442492f684735625462773166456e4249725162762b636144775147696f74554e316d4c4b77734379456f4766706746614251457645672b736a764c4c78704743334c304a5344532f74526169504354553344374e6249306547516651622f5a466f4c36455630775a324d6f583932414c572f5049752f56634663584e70596b356f7966326151416a536971486a2f363276354843644f525551303578754e6171795251625653704654303137655237675255636b4966366c6f447476342b514e4a4670766d74757077707774396a5a5974437a4b56743657726d6e36785837706658456251555434684f3758a201050803108703a201050804108103a20105080510c001a20105081d10cc01a2010408161078a20105080e10af01a201020815"
+    )
+    if thunderFF_pb2 is not None and hasattr(thunderFF_pb2, "StartMatch"):
+        try:
+            proto = thunderFF_pb2.StartMatch()
+            proto.ParseFromString(raw_pkt)
+            if hasattr(proto.main, 'region_list') and len(proto.main.region_list) > 0:
+                proto.main.region_list[0].region = region
+                if len(proto.main.region_list) > 1:
+                    proto.main.region_list[1].region = region
+            if hasattr(proto.main, 'client_version'):
+                proto.main.client_version.remote_version = client_version
+            raw_pkt = proto.SerializeToString()
+        except Exception:
+            pass
+
+    encrypted_packet = (await aes_encrypt(raw_pkt, key, iv)).hex()
+    packet_length = len(encrypted_packet) // 2
+    hex_length = hex(packet_length)[2:]
+    hex_length = hex_length if len(hex_length) > 1 else "0" + hex_length
+    final_packet = "031400" + "0" * (6 - len(hex_length)) + hex_length + encrypted_packet
+    writer.write(bytes.fromhex(final_packet))
+    await writer.drain()
+
+
+async def play_game(bot_ref, server_ip_port, thunder, sharma, udp_key, match_code,
+                    account_id, player_region, client_version, match_index: int):
+    global matches_completed_total
+    match_start_time = time.time()
+    ping_task = None
+    sock = None
+    ping_stop = asyncio.Event()
+    completed_cleanly = False
+
+    try:
+        ip, port = server_ip_port.split(":")
+        port = int(port)
+        resolved_ip = await resolve_host_cloudflare(ip)
+
+        loop = asyncio.get_running_loop()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        optimize_udp_socket(sock)
+        sock.setblocking(False)
+
+        udp_key_bytes = bytes.fromhex(udp_key)
+        hello_packet = await build_hello_packet(f"{account_id}_2585", udp_key_bytes, match_code)
+        await loop.sock_sendto(sock, bytes.fromhex(hello_packet), (resolved_ip, port))
+
+        ack_state = "waiting_for_hello_reply"
+        thunder_sent = False
+        sharma_sent = False
+        join_match_received = False
+        local_closed = False
+        send_lock = asyncio.Lock()
+
+        ping_task = asyncio.create_task(
+            keepalive_ping(sock, resolved_ip, port, udp_key_bytes, match_code, ping_stop)
+        )
+        last_activity = time.time()
+        MAX_IDLE_BEFORE_HELLO_RESEND = 7.0
+
+        push_log(f"[MATCH #{match_index}] UDP started -> {server_ip_port} (DNS: {resolved_ip})", "info")
+
+        async def send_thunder_sharma_inline():
+            nonlocal ack_state, thunder_sent, sharma_sent
+            if thunder_sent:
+                return
+            async with send_lock:
+                if thunder_sent:
+                    return
+                try:
+                    await loop.sock_sendto(sock, bytes.fromhex(thunder), (resolved_ip, port))
+                    thunder_sent = True
+                    await asyncio.sleep(0.1)
+                    prepare_ack = await build_packet(
+                        0x68, (await layouts_from_mask(match_code))[1],
+                        0, 2, None, 1, b"\x01\x00", udp_key_bytes
+                    )
+                    await loop.sock_sendto(sock, prepare_ack, (resolved_ip, port))
+                    await asyncio.sleep(0.2)
+                    await loop.sock_sendto(sock, bytes.fromhex(sharma), (resolved_ip, port))
+                    sharma_sent = True
+                    ack_state = "thunder_sharma_sent"
+                    push_log(f"[MATCH #{match_index}] Thunder+Sharma sent!", "success")
+                except Exception as e:
+                    push_log(f"[MATCH #{match_index}] send error: {e}", "error")
+
+        while not local_closed and not bot_ref.closed:
+            if time.time() - match_start_time > MAX_MATCH_DURATION:
+                break
+            try:
+                response, server_addr = await asyncio.wait_for(
+                    loop.sock_recvfrom(sock, 65535), timeout=1.5
+                )
+                if response:
+                    last_activity = time.time()
+                    frame = await decode_packet(response, udp_key_bytes, match_code)
+                    if frame:
+                        ptype = await classify(frame)
+
+                        if frame['cmd'] in [103, 107]:
+                            push_log(f"[MATCH #{match_index}] Completed (cmd {frame['cmd']})", "success")
+                            completed_cleanly = True
+                            local_closed = True
+                            continue
+
+                        if frame['cmd'] == 101:
+                            try:
+                                ack_pkt = await build_packet(
+                                    0x68, (await layouts_from_mask(match_code))[1],
+                                    0, 2, None, 1, b"\x01\x00", udp_key_bytes
+                                )
+                                await loop.sock_sendto(sock, ack_pkt, server_addr)
+                            except Exception:
+                                pass
+                            continue
+
+                        if ptype in ["ACK", "PING", "HELLO", "JOIN_MATCH"]:
+                            if ptype == "HELLO" and ack_state == "waiting_for_hello_reply":
+                                _, reply = await reply_for(
+                                    frame, udp_key_bytes, match_code, ack_style="short"
+                                )
+                                if reply:
+                                    await loop.sock_sendto(sock, reply, server_addr)
+                                ack_state = "ack_sent_waiting"
+                            elif ptype == "ACK":
+                                if ack_state == "waiting_for_hello_reply":
+                                    _, reply = await reply_for(frame, udp_key_bytes, match_code)
+                                    if reply:
+                                        await loop.sock_sendto(sock, reply, server_addr)
+                                    ack_state = "ready_to_send_thunder"
+                                elif ack_state == "ack_sent_waiting":
+                                    ack_state = "ready_to_send_thunder"
+                                else:
+                                    _, reply = await reply_for(frame, udp_key_bytes, match_code)
+                                    if reply:
+                                        await loop.sock_sendto(sock, reply, server_addr)
+                            elif ptype == "PING":
+                                _, reply = await reply_for(frame, udp_key_bytes, match_code)
+                                if reply:
+                                    await loop.sock_sendto(sock, reply, server_addr)
+                            elif ptype == "JOIN_MATCH" and not join_match_received:
+                                _, reply = await reply_for(frame, udp_key_bytes, match_code)
+                                if reply:
+                                    await loop.sock_sendto(sock, reply, server_addr)
+                                    join_match_received = True
+            except asyncio.TimeoutError:
+                if ack_state == "ready_to_send_thunder" and not thunder_sent:
+                    await send_thunder_sharma_inline()
+                elif ack_state == "waiting_for_hello_reply":
+                    if (time.time() - last_activity) > MAX_IDLE_BEFORE_HELLO_RESEND:
+                        try:
+                            pkt = await build_hello_packet(
+                                f"{account_id}_2585", udp_key_bytes, match_code
+                            )
+                            await loop.sock_sendto(sock, bytes.fromhex(pkt), (resolved_ip, port))
+                        except Exception:
+                            pass
+                        last_activity = time.time()
+                    if (time.time() - match_start_time) > 25.0:
+                        push_log(f"[MATCH #{match_index}] Handshake timeout", "warning")
+                        break
+                elif ack_state == "thunder_sharma_sent":
+                    if (time.time() - last_activity) > MATCH_IDLE_TIMEOUT:
+                        push_log(f"[MATCH #{match_index}] Finished naturally", "success")
+                        completed_cleanly = True
+                        break
+                continue
+            except BlockingIOError:
+                await asyncio.sleep(0.05)
+            except OSError:
+                await asyncio.sleep(0.5)
+                continue
+            except Exception:
+                await asyncio.sleep(0.5)
+                continue
+
+            if ack_state == "ready_to_send_thunder" and not thunder_sent:
+                await send_thunder_sharma_inline()
+
+        return f"match #{match_index} finished"
+    except Exception as e:
+        push_log(f"[MATCH #{match_index}] error: {e}", "error")
+        return f"match #{match_index} error"
+    finally:
+        if completed_cleanly:
+            bot_ref.matches_completed += 1
+            matches_completed_total += 1
+            # Estimate / record level-up EXP gain per completed Lone Wolf match
+            exp_gain = 100
+            bot_ref.gained_exp += exp_gain
+            bot_ref.current_exp += exp_gain
+        ping_stop.set()
+        if ping_task:
+            ping_task.cancel()
+            try:
+                await ping_task
+            except asyncio.CancelledError:
+                pass
+        if sock:
+            try:
+                sock.close()
+            except Exception:
+                pass
+        bot_ref.active_matches = max(0, bot_ref.active_matches - 1)
+        if not bot_ref.closed:
+            bot_ref.status = "PAUSED" if bot_ref.is_paused else ("IN_MATCH" if bot_ref.active_matches > 0 else "ONLINE")
+
+
+# ==================== LEVEL-UP BOT WORKER (REPLACING SQUAD LOGIC) ====================
 class LevelUpBot:
-    """Individual account worker for Level-Up / Solo Match mode (no squad)."""
     def __init__(self, login, on_close=None):
+        global matches_started_total
         self.login = login
         self.auth_uid = str(login.get("auth_uid") or login["bot_uid"])
         self.uid = int(login["bot_uid"])
         self.token = login["token"]
         self.access_token = login.get("access_token") or ""
-        self.client_version = login.get("client_version") or "1.134.21"
         self.key, self.iv = login["key"], login["iv"]
         self.ts = int(login["timestamp"])
         self.region = (login.get("region") or "ME")
+        self.client_version = str(login.get("client_version") or "1.134.21")
         self.name = login.get("account_name") or "Bot"
         self.level = int(login.get("level") or 1)
         self.initial_exp = int(login.get("exp") or 0)
@@ -1265,17 +1339,14 @@ class LevelUpBot:
         self._pause_started_at = None
         self.on_close = on_close
         self.online_r = self.online_w = None
-        self.chat_r = self.chat_w = None
-        self._chat_buf = bytearray()
         self._online_buf = bytearray()
-        self._tasks = []
-        self._udp_tasks = []
+        self._play_matches: List[asyncio.Task] = []
+        self._tasks: List[asyncio.Task] = []
         self.closed = False
-        self.persistent = False
-        self.owner_uid = None
-        self.voice_region_id = None
-        self.chat_region_id = None
-        self._match_index = 0
+        self.levelup_enabled = True
+        self._last_start_time = 0.0
+        self._search_attempts = 0
+        self._consecutive_parse_failures = 0
 
     def _spawn(self, coro):
         t = asyncio.create_task(coro)
@@ -1313,6 +1384,8 @@ class LevelUpBot:
             "initial_exp": self.initial_exp,
             "current_exp": self.current_exp,
             "gained_exp": self.gained_exp,
+            "matches_started": self.matches_started,
+            "matches_completed": self.matches_completed,
             "status": "PAUSED" if self.is_paused else self.status,
             "is_paused": self.is_paused,
             "active_matches": self.active_matches,
@@ -1321,330 +1394,177 @@ class LevelUpBot:
 
     async def connect(self):
         r = self.login
-        chat_ip = await resolve_host_cloudflare(r["chat_ip"])
-        self.chat_r, self.chat_w = await asyncio.wait_for(
-            asyncio.open_connection(chat_ip, int(r["chat_port"])), 6
+        resolved_ip = await resolve_host_cloudflare(r["online_ip"])
+        self.online_r, self.online_w = await asyncio.wait_for(
+            asyncio.open_connection(resolved_ip, int(r["online_port"])), 8
         )
-        if self.chat_w.get_extra_info('socket'):
-            optimize_tcp_socket(self.chat_w.get_extra_info('socket'))
-        self.chat_w.write(bytes.fromhex(
-            HELLXbuild_auth_startup(self.uid, self.token, self.ts, self.key, self.iv)
-        ))
-        await self.chat_w.drain()
-        self._spawn(self._chat_read_loop())
-        self._spawn(self._keepalive(self.chat_w))
-        await asyncio.sleep(0.3)
+        raw_sock = self.online_w.get_extra_info('socket')
+        if raw_sock:
+            optimize_tcp_socket(raw_sock)
 
         auth, _ = build_ob55_online_auth(self.uid, self.token, self.ts, self.key, self.iv)
-        online_ip = await resolve_host_cloudflare(r["online_ip"])
-        self.online_r, self.online_w = await asyncio.wait_for(
-            asyncio.open_connection(online_ip, int(r["online_port"])), 6
-        )
-        if self.online_w.get_extra_info('socket'):
-            optimize_tcp_socket(self.online_w.get_extra_info('socket'))
         self.online_w.write(auth)
         await self.online_w.drain()
+
+        try:
+            init_ka = await send_keep_alive(self.region)
+            if init_ka and self.online_w and not self.online_w.is_closing():
+                self.online_w.write(init_ka)
+                await asyncio.wait_for(self.online_w.drain(), timeout=3)
+        except Exception:
+            pass
+
         self._spawn(self._online_read_loop())
         self._spawn(self._keepalive(self.online_w))
+        self._spawn(self._levelup_match_loop())
         self.status = "PAUSED" if self.is_paused else "ONLINE"
 
     async def _keepalive(self, writer):
         try:
-            while not self.closed and not writer.transport.is_closing():
+            while not self.closed and not writer.is_closing():
                 await asyncio.sleep(5)
                 try:
-                    writer.write(bytes.fromhex("0201"))
+                    ka = await send_keep_alive(self.region)
+                    writer.write(ka)
                     await writer.drain()
                 except Exception:
                     break
         except asyncio.CancelledError:
             pass
 
-    async def play_udp_match(self, server_ip_port, thunder, sharma, udp_key, match_code, match_index: int):
-        """UDP match runner extracted from Level-Up code."""
-        global matches_completed_total
-        match_start_time = time.time()
-        ping_task = None
-        sock = None
-        ping_stop = asyncio.Event()
-        completed_cleanly = False
-
-        try:
-            ip, port = server_ip_port.split(":")
-            port = int(port)
-            resolved_ip = await resolve_host_cloudflare(ip)
-            loop = asyncio.get_running_loop()
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            optimize_udp_socket(sock)
-            sock.setblocking(False)
-
-            udp_key_bytes = bytes.fromhex(udp_key)
-            hello_packet = await build_hello_packet(f"{self.uid}_2585", udp_key_bytes, match_code)
-            await loop.sock_sendto(sock, bytes.fromhex(hello_packet), (resolved_ip, port))
-
-            ack_state = "waiting_for_hello_reply"
-            thunder_sent = False
-            sharma_sent = False
-            join_match_received = False
-            local_closed = False
-            send_lock = asyncio.Lock()
-
-            ping_task = asyncio.create_task(
-                keepalive_ping(sock, resolved_ip, port, udp_key_bytes, match_code, ping_stop)
-            )
-            last_activity = time.time()
-            max_idle_before_hello_resend = 7.0
-
-            async def send_thunder_sharma_inline():
-                nonlocal ack_state, thunder_sent, sharma_sent
-                if thunder_sent:
-                    return
-                async with send_lock:
-                    if thunder_sent:
-                        return
-                    await loop.sock_sendto(sock, bytes.fromhex(thunder), (resolved_ip, port))
-                    thunder_sent = True
-                    await asyncio.sleep(0.1)
-                    prepare_ack = await build_packet(
-                        0x68, (await layouts_from_mask(match_code))[1],
-                        0, 2, None, 1, b"\x01\x00", udp_key_bytes
-                    )
-                    await loop.sock_sendto(sock, prepare_ack, (resolved_ip, port))
-                    await asyncio.sleep(0.2)
-                    await loop.sock_sendto(sock, bytes.fromhex(sharma), (resolved_ip, port))
-                    sharma_sent = True
-                    ack_state = "thunder_sharma_sent"
-                    push_log(f"[MATCH #{match_index}] Thunder+Sharma sent for {self.name} ({self.uid})", "match")
-
-            while not local_closed:
-                if time.time() - match_start_time > MAX_MATCH_DURATION:
-                    break
-                try:
-                    response, server_addr = await asyncio.wait_for(
-                        loop.sock_recvfrom(sock, 65535), timeout=1.5
-                    )
-                    if response:
-                        last_activity = time.time()
-                        frame = await decode_packet(response, udp_key_bytes, match_code)
-                        if frame:
-                            ptype = await classify(frame)
-                            if frame.get('cmd') in [103, 107]:
-                                completed_cleanly = True
-                                local_closed = True
-                                continue
-                            if frame.get('cmd') == 101:
-                                ack_pkt = await build_packet(
-                                    0x68, (await layouts_from_mask(match_code))[1],
-                                    0, 2, None, 1, b"\x01\x00", udp_key_bytes
-                                )
-                                await loop.sock_sendto(sock, ack_pkt, server_addr)
-                                continue
-                            if ptype in ["ACK", "PING", "HELLO", "JOIN_MATCH"]:
-                                if ptype == "HELLO" and ack_state == "waiting_for_hello_reply":
-                                    _, reply = await reply_for(frame, udp_key_bytes, match_code, ack_style="short")
-                                    if reply:
-                                        await loop.sock_sendto(sock, reply, server_addr)
-                                    ack_state = "ack_sent_waiting"
-                                elif ptype == "ACK":
-                                    if ack_state == "waiting_for_hello_reply":
-                                        _, reply = await reply_for(frame, udp_key_bytes, match_code)
-                                        if reply:
-                                            await loop.sock_sendto(sock, reply, server_addr)
-                                        ack_state = "ready_to_send_thunder"
-                                    elif ack_state == "ack_sent_waiting":
-                                        ack_state = "ready_to_send_thunder"
-                                    else:
-                                        _, reply = await reply_for(frame, udp_key_bytes, match_code)
-                                        if reply:
-                                            await loop.sock_sendto(sock, reply, server_addr)
-                                elif ptype == "PING":
-                                    _, reply = await reply_for(frame, udp_key_bytes, match_code)
-                                    if reply:
-                                        await loop.sock_sendto(sock, reply, server_addr)
-                                elif ptype == "JOIN_MATCH" and not join_match_received:
-                                    _, reply = await reply_for(frame, udp_key_bytes, match_code)
-                                    if reply:
-                                        await loop.sock_sendto(sock, reply, server_addr)
-                                        join_match_received = True
-                except asyncio.TimeoutError:
-                    if ack_state == "ready_to_send_thunder" and not thunder_sent:
-                        await send_thunder_sharma_inline()
-                    elif ack_state == "waiting_for_hello_reply":
-                        if (time.time() - last_activity) > max_idle_before_hello_resend:
-                            try:
-                                pkt = await build_hello_packet(f"{self.uid}_2585", udp_key_bytes, match_code)
-                                await loop.sock_sendto(sock, bytes.fromhex(pkt), (resolved_ip, port))
-                            except Exception:
-                                pass
-                            last_activity = time.time()
-                        if (time.time() - match_start_time) > 25.0:
-                            break
-                    elif ack_state == "thunder_sharma_sent":
-                        if (time.time() - last_activity) > MATCH_IDLE_TIMEOUT:
-                            completed_cleanly = True
-                            break
-                    continue
-                except BlockingIOError:
-                    await asyncio.sleep(0.05)
-                except OSError:
-                    await asyncio.sleep(0.5)
-                    continue
-                except Exception:
-                    await asyncio.sleep(0.5)
-                    continue
-
-                if ack_state == "ready_to_send_thunder" and not thunder_sent:
-                    await send_thunder_sharma_inline()
-
-            if completed_cleanly:
-                self.matches_completed += 1
-                matches_completed_total += 1
-                self.gained_exp += 65
-                self.current_exp += 65
-        except Exception as e:
-            push_log(f"[MATCH #{match_index}] UDP error ({self.uid}): {e}", "warning")
-        finally:
-            ping_stop.set()
-            if ping_task and not ping_task.done():
-                ping_task.cancel()
-                try:
-                    await ping_task
-                except asyncio.CancelledError:
-                    pass
-            if sock:
-                try:
-                    sock.close()
-                except Exception:
-                    pass
-            self.active_matches = max(0, self.active_matches - 1)
-            if not self.is_paused and not self.closed:
-                self.status = "IN_MATCH" if self.active_matches > 0 else "ONLINE"
-
-    async def start_solo_match(self, timeout=8):
-        """Starts a solo match individually for THIS single account only (no squad)."""
+    async def trigger_start_match(self, region="BD"):
         global matches_started_total
-        if self.closed or self.is_paused:
+        if self.closed or self.is_paused or not self.levelup_enabled:
             return False
-        if not self.online_w or self.online_w.transport.is_closing():
+        if not self.online_w or self.online_w.is_closing():
             return False
+        self._search_attempts += 1
+        target_reg = (region or "BD").upper()
+        await asyncio.sleep(random.uniform(0.25, 0.55))
+        await start_game_lone_wolf(
+            target_reg, self.client_version, self.online_w, self.key, self.iv
+        )
+        self._last_start_time = asyncio.get_running_loop().time()
+        matches_started_total += 1
+        if not self.is_paused:
+            self.status = "SEARCHING" if self.active_matches == 0 else "IN_MATCH"
+        return True
 
-        self.status = "SEARCHING"
+    async def _levelup_match_loop(self):
         try:
-            await start_solo_match_packet(
-                self.region, self.client_version, self.online_w, self.key, self.iv
-            )
-            self._match_index += 1
-            self.matches_started += 1
-            matches_started_total += 1
-            self.active_matches = max(1, self.active_matches)
-            if not self.is_paused:
-                self.status = "IN_MATCH"
-            push_log(f"Solo match #{self._match_index} started for {self.name} ({self.uid})", "match")
-            return True
-        except Exception as e:
-            push_log(f"start_solo_match error ({self.uid}): {e}", "warning")
-            self.status = "PAUSED" if self.is_paused else "ONLINE"
-            return False
+            await asyncio.sleep(0.5)
+            while not self.closed:
+                self._play_matches[:] = [m for m in self._play_matches if not m.done()]
+                if self.levelup_enabled and not self.is_paused:
+                    now = asyncio.get_running_loop().time()
+                    if now - self._last_start_time >= START_MATCH_INTERVAL:
+                        await self.trigger_start_match("BD")
+                await asyncio.sleep(0.5)
+        except asyncio.CancelledError:
+            pass
 
     async def _online_read_loop(self):
         try:
-            while True:
-                data = await self.online_r.read(16384)
+            while not self.closed:
+                data = await asyncio.wait_for(self.online_r.read(8192), timeout=40.0)
                 if not data:
                     break
-                self._online_buf.extend(data)
                 hex_data = data.hex()
                 packet_length = len(data)
+
+                if hex_data.startswith("0300") and 10 < packet_length < 30:
+                    push_log(f"[{self.name}] Match starting, please wait...", "info")
+                    continue
+
                 if hex_data.startswith("0300") and packet_length >= 300:
+                    push_log(f"[{self.name}] MATCH FOUND! Loading UDP match...", "success")
                     try:
                         parsed = Parser().parse(hex_data[10:])
-                        res = json.loads(json.dumps(await parse_results(parsed)))
-                        token = udp_key = match_code = server_ip_port = block_val = None
+                        res = await parse_results(parsed)
+                        token = None
+                        udp_key = None
+                        match_code = None
+                        server_ip_port = None
+                        match_account_id = None
+                        block_val = None
+
                         if '42' in res and 'data' in res['42']:
                             match_code = res['42']['data']
                         if '5' in res and 'data' in res['5']:
-                            f5 = res['5']['data']
-                            server_ip_port = f5.get('2', {}).get('data')
-                            udp_key = f5.get('3', {}).get('data')
-                            token = f5.get('4', {}).get('data')
-                            block_val = f5.get('1', {}).get('data')
-                            if '42' in f5:
-                                match_code = f5['42']['data']
+                            res_field5 = res['5']['data']
+                            server_ip_port = res_field5.get('2', {}).get('data')
+                            udp_key = res_field5.get('3', {}).get('data')
+                            token = res_field5.get('4', {}).get('data')
+                            if '42' in res_field5:
+                                match_code = res_field5['42']['data']
+                        if '1' in res and 'data' in res['1']:
+                            match_account_id = res['1']['data']
+                        if '5' in res and 'data' in res['5']:
+                            block_val = res['5']['data'].get('1', {}).get('data')
+
+                        effective_acc_id = match_account_id or self.uid
                         if token and udp_key and match_code and server_ip_port:
                             thunder, sharma = await build_match_startup_packets(
-                                token, udp_key, match_code, self.uid, block_val or 0,
-                                server_ip=server_ip_port, region=self.region,
-                                client_version=self.client_version, access_token=self.access_token
+                                token, udp_key, match_code, effective_acc_id, block_val or 0,
+                                server_ip=server_ip_port,
+                                region=self.region,
+                                client_version=self.client_version,
+                                access_token=self.access_token
                             )
                             self.active_matches += 1
+                            self.matches_started += 1
                             if not self.is_paused:
                                 self.status = "IN_MATCH"
-                            udp_t = asyncio.create_task(
-                                self.play_udp_match(server_ip_port, thunder, sharma, udp_key, match_code, self._match_index)
+                            match_idx = self.matches_started
+                            task = asyncio.create_task(
+                                play_game(
+                                    self,
+                                    server_ip_port,
+                                    thunder,
+                                    sharma,
+                                    udp_key,
+                                    match_code,
+                                    effective_acc_id,
+                                    "BD",
+                                    self.client_version,
+                                    match_index=match_idx
+                                )
                             )
-                            self._udp_tasks.append(udp_t)
-                    except Exception:
-                        pass
-                await self._drain_frames(self._online_buf, self._on_online_packet)
+                            self._play_matches.append(task)
+                            self._consecutive_parse_failures = 0
+                            await asyncio.sleep(NEW_MATCH_DELAY)
+                        else:
+                            self._consecutive_parse_failures += 1
+                            if self._consecutive_parse_failures >= MAX_CONSECUTIVE_PARSE_FAILURES:
+                                cache_invalidate(self.auth_uid)
+                                self._consecutive_parse_failures = 0
+                            await asyncio.sleep(NON_MATCH_RECONNECT_DELAY)
+                    except Exception as e:
+                        push_log(f"[{self.name}] Match packet parse error: {e}", "warning")
+                        self._consecutive_parse_failures += 1
+                        await asyncio.sleep(NON_MATCH_RECONNECT_DELAY)
         except asyncio.CancelledError:
             return
         except Exception as e:
             push_log(f"online loop ({self.uid}): {e}", "warning")
         await self.close()
 
-    async def _chat_read_loop(self):
-        try:
-            while True:
-                data = await self.chat_r.read(16384)
-                if not data:
-                    break
-                self._chat_buf.extend(data)
-                await self._drain_frames(self._chat_buf, self._on_chat_packet)
-        except asyncio.CancelledError:
-            return
-        except Exception as e:
-            push_log(f"chat loop ({self.uid}): {e}", "warning")
-
-    @staticmethod
-    async def _drain_frames(buf, handler):
-        pos = 0
-        while len(buf) - pos >= 5:
-            length = struct.unpack(">I", buf[pos + 1:pos + 5])[0]
-            if 0 < length < 200000:
-                if pos + 5 + length > len(buf):
-                    break
-                payload = bytes(buf[pos + 5:pos + 5 + length])
-                try:
-                    pd = HELLXdecode_proto(payload)
-                    if pd:
-                        await handler(pd)
-                except Exception as e:
-                    push_log(f"packet error: {e}", "warning")
-                pos += 5 + length
-            else:
-                pos += 1
-        if pos:
-            del buf[:pos]
-
-    async def _on_online_packet(self, pd):
-        return
-
-    async def _on_chat_packet(self, pd):
-        return
-
     async def close(self):
         if self.closed:
             return
         self.closed = True
+        self.active_matches = 0
         self.status = "PAUSED" if self.is_paused else "OFFLINE"
-        for w in (self.online_w, self.chat_w):
-            if w:
-                try:
-                    w.close()
-                except Exception:
-                    pass
+        for m in self._play_matches:
+            if not m.done():
+                m.cancel()
+        if self.online_w:
+            try:
+                self.online_w.close()
+            except Exception:
+                pass
         me = asyncio.current_task()
-        for t in list(self._tasks) + list(self._udp_tasks):
+        for t in self._tasks:
             if t is not me and not t.done():
                 t.cancel()
         if self.on_close:
@@ -1719,7 +1639,7 @@ def remove_account_from_file(uid, auth_uid=""):
 
 class AccountPool:
     def __init__(self, concurrency=12):
-        self.accounts = []
+        self.accounts: List[LevelUpBot] = []
         self.credentials = {}
         self.lock = asyncio.Lock()
         self.current_index = 0
@@ -1744,7 +1664,6 @@ class AccountPool:
         if bot.is_paused:
             bot.status = "PAUSED"
         await bot.connect()
-        bot.persistent = True
         self.credentials[str(bot.uid)] = (pass_s, reg_s)
         self.credentials[uid_s] = (pass_s, reg_s)
 
@@ -1752,7 +1671,7 @@ class AccountPool:
             self.accounts = [a for a in self.accounts if a.uid != bot.uid and str(a.auth_uid) != uid_s]
             self.accounts.append(bot)
 
-        push_log(f"Account {uid_s} ({bot.name}) connected successfully", "success")
+        push_log(f"Account {uid_s} ({bot.name}) connected for Level-Up", "success")
         return bot
 
     async def load_and_connect(self):
@@ -1784,26 +1703,6 @@ class AccountPool:
         self.loading = False
         self.loaded = True
 
-    async def get_next_bot(self):
-        async with self.lock:
-            active = [a for a in self.accounts if not a.closed and not a.is_paused]
-            if not active:
-                return None
-            bot = active[self.current_index % len(active)]
-            self.current_index = (self.current_index + 1) % len(active)
-            return bot
-
-    async def wait_for_account(self, timeout=12):
-        deadline = asyncio.get_running_loop().time() + timeout
-        while asyncio.get_running_loop().time() < deadline:
-            bot = await self.get_next_bot()
-            if bot:
-                return bot
-            if self.loaded and not self.accounts:
-                return None
-            await asyncio.sleep(0.5)
-        return await self.get_next_bot()
-
     async def find_bot(self, uid):
         u = str(uid).strip()
         async with self.lock:
@@ -1827,6 +1726,7 @@ class AccountPool:
             self.accounts = kept
         for k in targets:
             self.credentials.pop(k, None)
+            cache_invalidate(k)
         remove_account_from_file(uid, auth_uid)
         for b in to_close:
             await b.close()
@@ -1840,6 +1740,7 @@ class AccountPool:
         if not cred:
             return False, "No saved credentials for refresh"
         pw, reg = cred
+        cache_invalidate(bot.auth_uid)
         await bot.close()
         reconnected = await self.connect_single(bot.auth_uid, pw, reg, persist=False)
         return (True, "Refreshed") if reconnected else (False, "Reconnect failed")
@@ -1882,9 +1783,50 @@ class AccountPool:
 account_pool = AccountPool(concurrency=12)
 
 
-async def _create_levelup_worker(region, clan_id, count, password):
-    """Creates individual guest accounts for Level-Up mode without forming squads."""
-    push_log(f"Creating {count} guest bots in region {region} for Level-Up mode...", "info")
+class LevelUpManager:
+    def __init__(self, pool: AccountPool):
+        self.pool = pool
+        self.auto_levelup_enabled = True
+        self.lock = asyncio.Lock()
+
+    async def start_levelup_all(self, region="BD"):
+        async with self.lock:
+            active = [b for b in self.pool.accounts if not b.closed and not b.is_paused]
+            if not active:
+                return {
+                    "ok": False,
+                    "error": "No active connected accounts available",
+                    "started_count": 0,
+                }
+            started = 0
+            for bot in active:
+                bot.levelup_enabled = True
+                if await bot.trigger_start_match(region=region):
+                    started += 1
+            push_log(f"Level-Up triggered on {started}/{len(active)} accounts (region: {region})", "success")
+            return {
+                "ok": True,
+                "started_count": started,
+                "total_active": len(active),
+                "region": region,
+            }
+
+    async def toggle_auto(self, enabled=None):
+        if enabled is None:
+            self.auto_levelup_enabled = not self.auto_levelup_enabled
+        else:
+            self.auto_levelup_enabled = bool(enabled)
+        for bot in self.pool.accounts:
+            bot.levelup_enabled = self.auto_levelup_enabled
+        push_log(f"Auto Level-Up: {'ENABLED' if self.auto_levelup_enabled else 'DISABLED'}", "info")
+        return self.auto_levelup_enabled
+
+
+levelup_manager = LevelUpManager(account_pool)
+
+
+async def _create_levelup_accounts_worker(region, clan_id, count, password):
+    push_log(f"Creating {count} guest accounts for Level-Up in {region} (Clan: {clan_id})...", "info")
     created = 0
     for _ in range(count):
         guest_uid = str(random.randint(3000000000, 4999999999))
@@ -1892,88 +1834,11 @@ async def _create_levelup_worker(region, clan_id, count, password):
         if bot:
             created += 1
         await asyncio.sleep(0.4)
-    push_log(f"Level-Up account creation finished: {created}/{count} bots connected in {region}", "success" if created else "warning")
-
-
-# =====================================================================
-# LEVEL-UP / SOLO MATCH MANAGER (INDIVIDUAL ACCOUNTS â NO SQUAD)
-# =====================================================================
-
-class LevelUpMatchManager:
-    def __init__(self, pool):
-        self.pool = pool
-        self.lock = asyncio.Lock()
-        self.auto_match_enabled = True
-
-    async def start_matches_for_accounts(self, target_uid=""):
-        async with self.lock:
-            if target_uid:
-                bot = await self.pool.find_bot(target_uid)
-                if not bot or bot.closed or bot.is_paused:
-                    msg = f"Account {target_uid} is not available or is paused"
-                    push_log(msg, "warning")
-                    return {"ok": False, "error": msg, "started_count": 0}
-                ok = await bot.start_solo_match()
-                return {
-                    "ok": ok,
-                    "error": None if ok else f"Failed to start solo match for {target_uid}",
-                    "started_count": 1 if ok else 0,
-                    "mode": "level_up_solo",
-                }
-
-            active_bots = [b for b in self.pool.accounts if not b.closed and not b.is_paused]
-            if not active_bots:
-                msg = "No active connected accounts available to start solo match"
-                push_log(msg, "warning")
-                return {"ok": False, "error": msg, "started_count": 0, "mode": "level_up_solo"}
-
-            results = await asyncio.gather(*(b.start_solo_match() for b in active_bots), return_exceptions=True)
-            started_count = sum(1 for r in results if r is True)
-            push_log(
-                f"Level-Up solo matches started for {started_count}/{len(active_bots)} individual account(s)",
-                "match" if started_count else "warning"
-            )
-            return {
-                "ok": started_count > 0,
-                "error": None if started_count > 0 else "Failed to start solo matches",
-                "started_count": started_count,
-                "total_eligible": len(active_bots),
-                "mode": "level_up_solo",
-            }
-
-
-levelup_manager = LevelUpMatchManager(account_pool)
-
-
-async def _auto_levelup_watcher():
-    """Watches connected accounts and starts solo matches individually for each active account (no squad)."""
-    while True:
-        try:
-            await asyncio.sleep(START_MATCH_INTERVAL)
-            if not levelup_manager.auto_match_enabled or all_paused_flag:
-                continue
-            idle_bots = [
-                b for b in account_pool.accounts
-                if not b.closed and not b.is_paused and b.active_matches == 0
-            ]
-            if idle_bots:
-                await asyncio.gather(*(b.start_solo_match() for b in idle_bots), return_exceptions=True)
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            push_log(f"auto_levelup_watcher error: {e}", "warning")
-
-
-async_loop.start_background(_auto_levelup_watcher())
+    push_log(f"Level-Up account creation finished: {created}/{count} in {region}", "success" if created else "warning")
 
 
 app = Flask(__name__)
-
-# ÙØ¨Ø¯Ø£ ØªØ­ÙÙÙ Ø§ÙØ­Ø³Ø§Ø¨Ø§Øª ÙÙ Ø§ÙØ®ÙÙÙØ© ÙÙØ±Ø§Ù Ø¯ÙÙ ØªØ£Ø®ÙØ± Ø¥ÙÙØ§Ø¹ Ø§ÙØ³ÙØ±ÙØ±
 async_loop.start_background(account_pool.load_and_connect())
-
-
-FALLBACK_HTML = '<!DOCTYPE html>\n<html lang="ar" dir="rtl">\n<head>\n  <meta charset="UTF-8" />\n  <meta name="viewport" content="width=device-width, initial-scale=1.0" />\n  <title>Ø±Ø§ÙÙÙ ÙØµÙ - ÙÙÙ Ø£Ø¨ ÙØ±Ø¯Ù</title>\n  <style>\n    body { font-family: Tahoma, Arial, sans-serif; background: #0d0b14; color: #f3effa; margin: 0; padding: 16px; }\n    .card { background: #171324; border: 1px solid #2b2342; border-radius: 14px; padding: 16px; margin-bottom: 14px; }\n    .btn { background: linear-gradient(135deg, #7c3aed, #5b21b6); color: #fff; border: none; padding: 12px 18px; border-radius: 10px; font-size: 15px; font-weight: bold; cursor: pointer; margin: 4px; }\n    .btn-green { background: linear-gradient(135deg, #059669, #047857); }\n    .btn-gray { background: #2c2440; }\n    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }\n    .stat { background: #110e1c; padding: 12px; border-radius: 10px; text-align: center; }\n    .acc { background: #110e1c; padding: 12px; border-radius: 10px; margin-top: 8px; display: flex; justify-content: space-between; align-items: center; }\n    .badge { padding: 4px 10px; border-radius: 999px; font-size: 12px; background: #1e3a2f; color: #34d399; }\n    .logs { background: #09070f; padding: 10px; border-radius: 10px; max-height: 240px; overflow-y: auto; font-family: monospace; font-size: 12px; direction: ltr; text-align: left; }\n    input { background: #0e0b18; color: #fff; border: 1px solid #352b52; padding: 8px 10px; border-radius: 8px; margin: 4px; }\n  </style>\n</head>\n<body>\n  <div class="card">\n    <h2>â¡ Ø±Ø§ÙÙÙ ÙØµÙ â ÙØ¶Ø¹ ÙÙÙ Ø£Ø¨ Ø§ÙÙØ±Ø¯Ù (Ø¨Ø¯ÙÙ Ø³ÙÙØ§Ø¯)</h2>\n    <button id="btnSoloMatch" class="btn btn-green" onclick="startSoloMatch()">ð Ø¨Ø¯Ø¡ ÙØ§ØªØ´ ÙÙÙ Ø£Ø¨ ÙØ±Ø¯Ù ÙÙÙ Ø­Ø³Ø§Ø¨</button>\n    <button class="btn btn-gray" onclick="toggleAutoMatch()">ð ØªØ¨Ø¯ÙÙ Ø§ÙØªØ´ØºÙÙ Ø§ÙØªÙÙØ§Ø¦Ù</button>\n    <button class="btn" onclick="openAddForm()">â Ø¥Ø¶Ø§ÙØ© Ø­Ø³Ø§Ø¨</button>\n    <div id="addBox" style="display:none; margin-top:10px;">\n      <input id="inpUid" placeholder="UID" />\n      <input id="inpPass" placeholder="Password" />\n      <input id="inpRegion" value="ME" style="width:65px" />\n      <button class="btn" onclick="addAccount()">Ø­ÙØ¸ ÙØ§ØªØµØ§Ù</button>\n    </div>\n    <div id="msgBox" style="margin-top:10px; color:#a78bfa;"></div>\n  </div>\n\n  <div class="card grid">\n    <div class="stat"><div>Ø§ÙØ­Ø³Ø§Ø¨Ø§Øª Ø§ÙÙØªØµÙØ©</div><h3 id="sAccs">0</h3></div>\n    <div class="stat"><div>Ø§ÙÙØ§ØªØ´Ø§Øª Ø§ÙÙØ¨Ø¯ÙØ¡Ø©</div><h3 id="sMatches">0</h3></div>\n    <div class="stat"><div>Ø§ÙÙ EXP Ø§ÙÙÙØªØ³Ø¨</div><h3 id="sExp">0</h3></div>\n    <div class="stat"><div>Ø§ÙØªØ´ØºÙÙ Ø§ÙØªÙÙØ§Ø¦Ù</div><h3 id="sAuto">ÙÙØ¹Ù</h3></div>\n  </div>\n\n  <div class="card">\n    <h3>Ø§ÙØ­Ø³Ø§Ø¨Ø§Øª</h3>\n    <div id="accsList"></div>\n  </div>\n\n  <div class="card">\n    <h3>Ø³Ø¬Ù Ø§ÙØ£Ø­Ø¯Ø§Ø«</h3>\n    <div id="logsBox" class="logs"></div>\n  </div>\n\n  <script>\n    function openAddForm() {\n      const el = document.getElementById("addBox");\n      el.style.display = el.style.display === "none" ? "block" : "none";\n    }\n    async function addAccount() {\n      const uid = document.getElementById("inpUid").value.trim();\n      const password = document.getElementById("inpPass").value.trim();\n      const region = document.getElementById("inpRegion").value.trim() || "ME";\n      const r = await fetch("/api/account/add", {\n        method: "POST",\n        headers: {"Content-Type": "application/json"},\n        body: JSON.stringify({uid, password, region})\n      });\n      const d = await r.json();\n      document.getElementById("msgBox").innerText = d.status === "ok" ? ("ØªÙ Ø±Ø¨Ø· Ø§ÙØ­Ø³Ø§Ø¨: " + d.nickname) : (d.error || "ÙØ´Ù Ø§ÙØ±Ø¨Ø·");\n      refreshStats();\n    }\n    async function startSoloMatch() {\n      const btn = document.getElementById("btnSoloMatch");\n      btn.disabled = true;\n      document.getElementById("msgBox").innerText = "Ø¬Ø§Ø±Ù Ø¨Ø¯Ø¡ ÙØ§ØªØ´ ÙÙÙ Ø£Ø¨ ÙØ±Ø¯Ù...";\n      try {\n        const r = await fetch("/api/match/start", {\n          method: "POST",\n          headers: {"Content-Type": "application/json"},\n          body: JSON.stringify({})\n        });\n        const d = await r.json();\n        if (d.ok) {\n          document.getElementById("msgBox").innerText = "â ØªÙ Ø¨Ø¯Ø¡ Ø§ÙÙØ§ØªØ´ Ø§ÙÙØ±Ø¯Ù (" + (d.started_count || 0) + " Ø­Ø³Ø§Ø¨)";\n        } else {\n          document.getElementById("msgBox").innerText = "â ï¸ " + (d.error || "ØªØ¹Ø°Ø± Ø¨Ø¯Ø¡ Ø§ÙÙØ§ØªØ´");\n        }\n      } catch (e) {\n        document.getElementById("msgBox").innerText = "â Ø®Ø·Ø£ ÙÙ Ø§ÙØ§ØªØµØ§Ù Ø¨Ø§ÙØ³ÙØ±ÙØ±";\n      } finally {\n        btn.disabled = false;\n        refreshStats();\n      }\n    }\n    async function toggleAutoMatch() {\n      const r = await fetch("/api/match/auto", {method: "POST", headers: {"Content-Type": "application/json"}, body: "{}"});\n      const d = await r.json();\n      document.getElementById("msgBox").innerText = "Ø§ÙØªØ´ØºÙÙ Ø§ÙØªÙÙØ§Ø¦Ù ÙÙÙ Ø£Ø¨: " + (d.auto_match_enabled ? "ÙÙØ¹Ù" : "ÙØªÙÙÙ");\n      refreshStats();\n    }\n    async function refreshStats() {\n      const r = await fetch("/api/stats");\n      const d = await r.json();\n      document.getElementById("sAccs").innerText = d.total_accounts || 0;\n      document.getElementById("sMatches").innerText = d.total_matches_started || 0;\n      document.getElementById("sExp").innerText = d.total_gained_exp || 0;\n      document.getElementById("sAuto").innerText = d.auto_match_enabled ? "ÙÙØ¹Ù" : "ÙØªÙÙÙ";\n      const list = document.getElementById("accsList");\n      list.innerHTML = (d.accounts || []).map(a =>\n        `<div class="acc"><div><b>${a.nickname}</b> (${a.uid}) | EXP: ${a.gained_exp || 0}</div><span class="badge">${a.status}</span></div>`\n      ).join("") || "<div>ÙØ§ ØªÙØ¬Ø¯ Ø­Ø³Ø§Ø¨Ø§Øª ÙØªØµÙØ© Ø­Ø§ÙÙØ§Ù</div>";\n      const logs = document.getElementById("logsBox");\n      logs.innerHTML = (d.logs || []).slice(-60).map(l => `<div>[${l.time}] [${l.level}] ${l.message}</div>`).join("");\n      logs.scrollTop = logs.scrollHeight;\n    }\n    setInterval(refreshStats, 2500);\n    refreshStats();\n  </script>\n</body>\n</html>\n'
 
 
 @app.route("/", methods=["GET"])
@@ -1982,17 +1847,18 @@ def index():
     html_path = os.path.join(base_dir, "index.html")
     if os.path.exists(html_path):
         return send_file(html_path)
-    return FALLBACK_HTML, 200
+    return jsonify({"status": "online", "mode": "level_up", "DEV": DEV_NAME}), 200
 
 
 @app.route("/status_json", methods=["GET"])
 @app.route("/status", methods=["GET"])
-def status():
+def status_route():
     return jsonify({
         "status": "online",
-        "mode": "level_up_solo",
+        "mode": "level_up",
         "accounts_loaded": len(account_pool.accounts),
         "loading": account_pool.loading,
+        "auto_levelup_enabled": levelup_manager.auto_levelup_enabled,
         "DEV": DEV_NAME
     }), 200
 
@@ -2010,7 +1876,7 @@ def api_stats():
         logs_copy = list(ui_logs)
     return jsonify({
         "ok": True,
-        "mode": "level_up_solo",
+        "mode": "level_up",
         "total_accounts": len(accs),
         "total_matches_started": total_started,
         "total_matches": total_done,
@@ -2020,7 +1886,7 @@ def api_stats():
         "uptime": int(uptime_sec),
         "accounts": accs,
         "logs": logs_copy,
-        "auto_match_enabled": levelup_manager.auto_match_enabled,
+        "auto_levelup_enabled": levelup_manager.auto_levelup_enabled,
         "DEV": DEV_NAME,
     }), 200
 
@@ -2104,8 +1970,8 @@ def api_create_team():
     password = str(body.get("password") or "RAFIN TxT").strip() or "RAFIN TxT"
     if not clan_id:
         return jsonify({"ok": False, "error": "Clan ID is required"}), 400
-    async_loop.start_background(_create_levelup_worker(region, clan_id, count, password))
-    return jsonify({"ok": True, "region": region, "clan_id": clan_id, "count": count, "mode": "level_up_solo"}), 200
+    async_loop.start_background(_create_levelup_accounts_worker(region, clan_id, count, password))
+    return jsonify({"ok": True, "region": region, "clan_id": clan_id, "count": count}), 200
 
 
 @app.route("/api/logs/clear", methods=["POST"])
@@ -2115,32 +1981,21 @@ def api_logs_clear():
     return jsonify({"ok": True}), 200
 
 
-@app.route("/api/match/start", methods=["GET", "POST"])
 @app.route("/api/levelup/start", methods=["GET", "POST"])
-def api_match_start():
+def api_levelup_start():
     body = request.get_json(silent=True) or {}
-    target_uid = str(body.get("uid") or request.args.get("uid") or "").strip()
-    result = async_loop.run(
-        levelup_manager.start_matches_for_accounts(target_uid=target_uid),
-        timeout=25
-    )
-    status_code = 200 if result.get("ok") else 400
-    result["DEV"] = DEV_NAME
-    return jsonify(result), status_code
+    region = str(body.get("region") or request.args.get("region") or "BD").upper().strip()
+    res = async_loop.run(levelup_manager.start_levelup_all(region=region), timeout=25)
+    res["DEV"] = DEV_NAME
+    return jsonify(res), (200 if res.get("ok") else 400)
 
 
-@app.route("/api/match/auto", methods=["POST"])
-def api_match_auto():
+@app.route("/api/levelup/auto", methods=["POST"])
+def api_levelup_auto():
     body = request.get_json(silent=True) or {}
-    if "enabled" in body:
-        levelup_manager.auto_match_enabled = bool(body["enabled"])
-    else:
-        levelup_manager.auto_match_enabled = not levelup_manager.auto_match_enabled
-    push_log(
-        f"Auto Level-Up solo match: {'ENABLED' if levelup_manager.auto_match_enabled else 'DISABLED'}",
-        "info"
-    )
-    return jsonify({"ok": True, "auto_match_enabled": levelup_manager.auto_match_enabled, "DEV": DEV_NAME}), 200
+    enabled = body.get("enabled") if "enabled" in body else None
+    state = async_loop.run(levelup_manager.toggle_auto(enabled=enabled), timeout=10)
+    return jsonify({"ok": True, "auto_levelup_enabled": state, "DEV": DEV_NAME}), 200
 
 
 if __name__ == "__main__":
