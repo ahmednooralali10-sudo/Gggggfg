@@ -1460,6 +1460,8 @@ class LevelUpBot:
         matches_started_total += 1
         if not self.is_paused:
             self.status = "SEARCHING" if self.active_matches == 0 else "IN_MATCH"
+        if self._search_attempts == 1 or self._search_attempts % 4 == 0:
+            push_log(f"[{self.name}] Searching match ({target_reg}) - attempt #{self._search_attempts}...", "info")
         return True
 
     async def _levelup_match_loop(self):
@@ -1478,7 +1480,12 @@ class LevelUpBot:
     async def _online_read_loop(self):
         try:
             while not self.closed:
-                data = await asyncio.wait_for(self.online_r.read(8192), timeout=40.0)
+                try:
+                    data = await asyncio.wait_for(self.online_r.read(8192), timeout=20.0)
+                except asyncio.TimeoutError:
+                    if not self.closed and not self.is_paused and self.active_matches == 0:
+                        self.status = "ONLINE"
+                    continue
                 if not data:
                     break
                 hex_data = data.hex()
@@ -1614,17 +1621,27 @@ def _accs_file_path():
     return os.path.join(base_dir, "accs.txt")
 
 
-def append_account_to_file(uid, password):
+def append_account_to_file(uid, password, region="ME"):
     path = _accs_file_path()
-    line = f"{str(uid).strip()}:{str(password).strip()}\n"
+    reg_s = (region or "ME").upper().strip()
+    line = f"{str(uid).strip()}:{str(password).strip()}:{reg_s}\n"
     existing = []
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
             existing = [l.strip() for l in f if l.strip()]
     uid_prefix = f"{str(uid).strip()}:"
-    if not any(l.startswith(uid_prefix) for l in existing):
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(line)
+    updated = False
+    new_existing = []
+    for item in existing:
+        if item.startswith(uid_prefix):
+            new_existing.append(line.strip())
+            updated = True
+        else:
+            new_existing.append(item)
+    if not updated:
+        new_existing.append(line.strip())
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(new_existing) + ("\n" if new_existing else ""))
 
 
 def remove_account_from_file(uid, auth_uid=""):
@@ -1665,7 +1682,7 @@ class AccountPool:
         reg_s = (region or "ME").upper()
         if persist and uid_s and pass_s and not token_override:
             self.credentials[uid_s] = (pass_s, reg_s)
-            append_account_to_file(uid_s, pass_s)
+            append_account_to_file(uid_s, pass_s, reg_s)
 
         login = await do_login(uid_s, pass_s, reg_s, token_override=token_override)
         if not login:
@@ -1704,10 +1721,12 @@ class AccountPool:
 
         async def _worker(line):
             async with sem:
-                uid, password = line.split(":", 1)
-                uid, password = uid.strip(), password.strip()
+                parts = [p.strip() for p in line.split(":")]
+                uid = parts[0] if len(parts) > 0 else ""
+                password = parts[1] if len(parts) > 1 else ""
+                reg = (parts[2].upper() if len(parts) > 2 and parts[2] else "ME")
                 try:
-                    await self.connect_single(uid, password, "ME", persist=False)
+                    await self.connect_single(uid, password, reg, persist=False)
                 except Exception as e:
                     push_log(f"Account {uid} error: {e}", "error")
 
@@ -1913,7 +1932,10 @@ def api_account_add():
     token = str(body.get("token") or "").strip()
     uid = str(body.get("uid") or "").strip()
     password = str(body.get("password") or "").strip()
-    region = str(body.get("region") or "ME").upper().strip()
+    raw_region = str(body.get("region") or "").upper().strip()
+    if not raw_region:
+        return jsonify({"status": "error", "error": "Region is required (e.g. ME, BD, IND, SG, TH, EU, NA)"}), 400
+    region = raw_region
 
     if token:
         acc_id = uid or str(random.randint(1000000000, 9999999999))
@@ -1925,7 +1947,7 @@ def api_account_add():
 
     if not bot:
         return jsonify({"status": "error", "error": "Failed to login or connect account"}), 400
-    return jsonify({"status": "ok", "uid": str(bot.uid), "nickname": bot.name}), 200
+    return jsonify({"status": "ok", "uid": str(bot.uid), "nickname": bot.name, "region": bot.region}), 200
 
 
 @app.route("/api/account/delete", methods=["POST"])
