@@ -71,11 +71,11 @@ TOKEN_CACHE_FILE = "token_cache.json"
 DEVICES_FILE = "devices.json"
 TOKEN_CACHE_TTL = 1200
 
-START_MATCH_INTERVAL = 3.0
+START_MATCH_INTERVAL = 12.0
 NEW_MATCH_DELAY = 3.0
 MAX_MATCH_DURATION = 700
 MATCH_IDLE_TIMEOUT = 8.0
-PRIORITY_REGIONS = ["BD", "IND", "SG", "TH", "PH", "VN", "MY", "ID", "HK", "TW"]
+PRIORITY_REGIONS = ["ME", "BD", "IND", "SG", "TH", "PH", "VN", "MY", "ID", "HK", "TW"]
 MAX_CONSECUTIVE_PARSE_FAILURES = 5
 NON_MATCH_RECONNECT_DELAY = 1.0
 
@@ -492,7 +492,7 @@ async def sv_frame(msg_key, layout, send_option, cmd, order_id, flags, content, 
 
 
 async def build_match_startup_packets(token, udp_key, match_code, account_id, block_val,
-                                      server_ip="", region="BD", client_version="1.132.6",
+                                      server_ip="", region="ME", client_version="1.134.21",
                                       client_version_code="2019121229", access_token=""):
     token = token.strip()
     udp_key = bytes.fromhex(udp_key)
@@ -505,7 +505,7 @@ async def build_match_startup_packets(token, udp_key, match_code, account_id, bl
 
     garena420 = await has_ssan_zig(len(encoded_thunder_jwt)) + encoded_thunder_jwt
 
-    reg = str(region).upper() if region else "BD"
+    reg = str(region).upper() if region else "ME"
     csoversea_block = bytes.fromhex(
         "ca0163736f7665727365612e7374726f6e67686f6c642e66726565666972656d6f62696c652e636f6d"
         "3b302e302e302e303b33342e3132362e37362e34353b33342e38372e3137372e31343b33342e38372e"
@@ -719,8 +719,8 @@ async def decode_packet(packet, key, mask=None):
     return candidates[0]
 
 
-async def send_keep_alive(region="BD"):
-    reg = str(region).upper() if region else "BD"
+async def send_keep_alive(region="ME"):
+    reg = str(region).upper() if region else "ME"
     ka_hex = "0219" if reg == "BD" else ("0214" if reg == "IND" else "0215")
     return bytes.fromhex(ka_hex)
 
@@ -1107,19 +1107,26 @@ async def do_login(uid, password, region_pref="ME", token_override=None):
 
 # ==================== LEVEL-UP UDP MATCH & LONE WOLF ENGINE ====================
 async def start_game_lone_wolf(region, client_version, writer, key, iv):
-    raw_pkt = bytes.fromhex(
+    reg = (region or "ME").upper()
+    ver = str(client_version or "1.134.21")
+    old_ver_bytes = b"B1.130.22"
+    new_ver_bytes = b"B" + bytes([len(ver)]) + ver.encode("utf-8")
+
+    raw_hex = (
         "080112800a0a010b102b3a110a044944433110aa011a064555524f50453a100a044944433210311a064555524f504540014a0801090a0b1219202758016291090a8001303838463832424630324139363736373032303130313030303030303030303030303136303030313030313530303032323246393745454530463030303030303436373632353134303030303030303030303030303030303030303030303030303030303030303030303030303066663030303030303030636163666131366410241afb02735d5e571400024a775d45414d1a041b1c001f11010449715f4243481a001e1d071c1703004b1a4066785c524570735c51486775421b5c5a4c07504042685a63610816054e19025e75196001477c015165406370195f5547404e4550640103020f1304064863754268676c755f65576e40467e5f0a417a4701026d675d6e73670b1108495a4c6a0b78470b740065645e525a057258425f584a447d4e6759440c11044e7c596d7f4b625f7d04055a47505c4e1d6b5b4107447d7201057d7f0f14084e430457674f7e517d72015172415d027473577c4d615f79535256780911030f4d5e027a797f614165067806505d53777750475e75064257076500460817014e741e7e5078487e7a7c465e7669767153497064605a7376677773550d160148037e18675966787f4c42607a645f577e7b441b460776026b18685d0b110205490060020f70676175654674706671797f41067346677c4e06585e780f15074c57047b40517075415f6364027259674b5b0166407f7340600407770a22047a5d5c52300b3a0a167305067162727516134208312e3133302e3232480350015ae90403626253513635686e556f4e36416456324b796f566c636f477776484f624e56526c4d727073504b4f43654177616848494176795556497273743752737149734a7a786b3247525268377a2f637664626d504f6a73552f79626d38547a4c69586d2f474351696d494b53486833447955726f39515152756c34545350626d6d624b7949565937545671577059455372323646572f59624578507338514f706d317372785455736c30796a434144444d4f34616a654b615753366361496c554b4963797a494e396d52516f715277687939797257476d337a644345337a6a61436f492f5a585233656f65365a42647a64677654636b6b665733356e4d4c6a6a565072564b6433523172756174394e50514150724a5546627859696c4c5a3859707336654d5447666b6649793574666a526c314d4648706b51774c6373374439656378566c41636f374e664f6d2b30654756466c4434744478706771385533595973587645384842502f70666c767a737138316a32524f4d7857437556445442492f684735625462773166456e4249725162762b636144775147696f74554e316d4c4b77734379456f4766706746614251457645672b736a764c4c78704743334c304a5344532f74526169504354553344374e6249306547516651622f5a466f4c36455630775a324d6f583932414c572f5049752f56634663584e70596b356f7966326151416a536971486a2f363276354843644f525551303578754e6171795251625653704654303137655237675255636b4966366c6f447476342b514e4a4670766d74757077707774396a5a5974437a4b56743657726d6e36785837706658456251555434684f3758a201050803108703a201050804108103a20105080510c001a20105081d10cc01a2010408161078a20105080e10af01a201020815"
     )
+    raw_pkt = bytes.fromhex(raw_hex).replace(old_ver_bytes, new_ver_bytes)
+
     if thunderFF_pb2 is not None and hasattr(thunderFF_pb2, "StartMatch"):
         try:
             proto = thunderFF_pb2.StartMatch()
             proto.ParseFromString(raw_pkt)
             if hasattr(proto.main, 'region_list') and len(proto.main.region_list) > 0:
-                proto.main.region_list[0].region = region
+                proto.main.region_list[0].region = reg
                 if len(proto.main.region_list) > 1:
-                    proto.main.region_list[1].region = region
+                    proto.main.region_list[1].region = reg
             if hasattr(proto.main, 'client_version'):
-                proto.main.client_version.remote_version = client_version
+                proto.main.client_version.remote_version = ver
             raw_pkt = proto.SerializeToString()
         except Exception:
             pass
@@ -1184,7 +1191,7 @@ async def play_game(bot_ref, server_ip_port, thunder, sharma, udp_key, match_cod
                     await asyncio.sleep(0.1)
                     prepare_ack = await build_packet(
                         0x68, (await layouts_from_mask(match_code))[1],
-                        0, 2, None, 1, b"\x01\x00", udp_key_bytes
+                        0, 2, None, 1, b" ", udp_key_bytes
                     )
                     await loop.sock_sendto(sock, prepare_ack, (resolved_ip, port))
                     await asyncio.sleep(0.2)
@@ -1218,7 +1225,7 @@ async def play_game(bot_ref, server_ip_port, thunder, sharma, udp_key, match_cod
                             try:
                                 ack_pkt = await build_packet(
                                     0x68, (await layouts_from_mask(match_code))[1],
-                                    0, 2, None, 1, b"\x01\x00", udp_key_bytes
+                                    0, 2, None, 1, b" ", udp_key_bytes
                                 )
                                 await loop.sock_sendto(sock, ack_pkt, server_addr)
                             except Exception:
@@ -1327,7 +1334,7 @@ class LevelUpBot:
         self.access_token = login.get("access_token") or ""
         self.key, self.iv = login["key"], login["iv"]
         self.ts = int(login["timestamp"])
-        self.region = (login.get("region") or "ME")
+        self.region = (login.get("region") or "ME").upper()
         self.client_version = str(login.get("client_version") or "1.134.21")
         self.name = login.get("account_name") or "Bot"
         self.level = int(login.get("level") or 1)
@@ -1437,14 +1444,14 @@ class LevelUpBot:
         except asyncio.CancelledError:
             pass
 
-    async def trigger_start_match(self, region="BD"):
+    async def trigger_start_match(self, region=None):
         global matches_started_total
         if self.closed or self.is_paused or not self.levelup_enabled:
             return False
         if not self.online_w or self.online_w.is_closing():
             return False
         self._search_attempts += 1
-        target_reg = (region or "BD").upper()
+        target_reg = (region or self.region or "ME").upper()
         await asyncio.sleep(random.uniform(0.25, 0.55))
         await start_game_lone_wolf(
             target_reg, self.client_version, self.online_w, self.key, self.iv
@@ -1457,13 +1464,13 @@ class LevelUpBot:
 
     async def _levelup_match_loop(self):
         try:
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(1.5)
             while not self.closed:
                 self._play_matches[:] = [m for m in self._play_matches if not m.done()]
-                if self.levelup_enabled and not self.is_paused:
+                if self.levelup_enabled and not self.is_paused and self.active_matches == 0:
                     now = asyncio.get_running_loop().time()
                     if now - self._last_start_time >= START_MATCH_INTERVAL:
-                        await self.trigger_start_match("BD")
+                        await self.trigger_start_match(self.region)
                 await asyncio.sleep(0.5)
         except asyncio.CancelledError:
             pass
@@ -1530,7 +1537,7 @@ class LevelUpBot:
                                     udp_key,
                                     match_code,
                                     effective_acc_id,
-                                    "BD",
+                                    self.region,
                                     self.client_version,
                                     match_index=match_idx
                                 )
@@ -1794,7 +1801,7 @@ class LevelUpManager:
         self.auto_levelup_enabled = True
         self.lock = asyncio.Lock()
 
-    async def start_levelup_all(self, region="BD"):
+    async def start_levelup_all(self, region=None):
         async with self.lock:
             active = [b for b in self.pool.accounts if not b.closed and not b.is_paused]
             if not active:
@@ -1804,16 +1811,20 @@ class LevelUpManager:
                     "started_count": 0,
                 }
             started = 0
+            used_regions = set()
             for bot in active:
                 bot.levelup_enabled = True
-                if await bot.trigger_start_match(region=region):
+                target_reg = (region or bot.region or "ME").upper()
+                if await bot.trigger_start_match(region=target_reg):
                     started += 1
-            push_log(f"Level-Up triggered on {started}/{len(active)} accounts (region: {region})", "success")
+                    used_regions.add(target_reg)
+            reg_label = ", ".join(sorted(used_regions)) if used_regions else (region or "ME")
+            push_log(f"Level-Up triggered on {started}/{len(active)} accounts (region: {reg_label})", "success")
             return {
                 "ok": True,
                 "started_count": started,
                 "total_active": len(active),
-                "region": region,
+                "region": reg_label,
             }
 
     async def toggle_auto(self, enabled=None):
@@ -1982,7 +1993,8 @@ def api_create_team():
 @app.route("/api/levelup/start", methods=["POST"])
 def api_levelup_start():
     body = request.get_json(silent=True) or {}
-    region = str(body.get("region") or "BD").upper().strip()
+    raw_reg = body.get("region")
+    region = str(raw_reg).upper().strip() if raw_reg else None
     res = async_loop.run(levelup_manager.start_levelup_all(region=region))
     return jsonify(res), (200 if res.get("ok") else 400)
 
