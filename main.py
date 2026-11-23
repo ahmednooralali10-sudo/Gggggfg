@@ -21,6 +21,7 @@ from Crypto.Util.Padding import pad, unpad
 from Pb2 import MajoRLoGinrEs_pb2, MajoRLoGinrEq_pb2, PorTs_pb2
 
 DEV_NAME = "JAGWAR x STRAVEX"
+START_TIME = time.time()
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 log = logging.getLogger("jagwar")
@@ -31,7 +32,8 @@ AES_IV = b'6oyZDr22E3ychjM%'
 REGION_LANG = {
     "BD": "bn", "IND": "hi", "PK": "ur", "SG": "en", "ID": "id",
     "ME": "ar", "VN": "vi", "TW": "zh", "CIS": "ru", "TH": "th",
-    "EU": "en", "US": "en", "SAC": "es", "LK": "en", "BR": "pt"
+    "EU": "en", "US": "en", "SAC": "es", "LK": "en", "BR": "pt",
+    "RU": "ru", "NA": "en"
 }
 
 DEFAULT_HEADERS = {
@@ -45,6 +47,27 @@ DEFAULT_HEADERS = {
     'X-GA': 'v1 1',
     'ReleaseVersion': 'OB55',
 }
+
+ui_logs = []
+ui_logs_lock = threading.Lock()
+matches_started_total = 0
+matches_completed_total = 0
+all_paused_flag = False
+
+
+def push_log(message, level="info"):
+    ts = datetime.now().strftime("%H:%M:%S")
+    entry = {"time": ts, "level": level, "message": str(message)}
+    with ui_logs_lock:
+        ui_logs.append(entry)
+        if len(ui_logs) > 500:
+            del ui_logs[:-500]
+    if level == "error":
+        log.error(message)
+    elif level == "warning":
+        log.warning(message)
+    else:
+        log.info(message)
 
 
 def HELLXenc_packet(payload, key, iv):
@@ -463,14 +486,15 @@ _CACHED_VER_CFG = {}
 
 
 async def version_config(client_http, region="ME"):
-    if region in _CACHED_VER_CFG:
-        return _CACHED_VER_CFG[region]
+    reg = (region or "ME").upper()
+    if reg in _CACHED_VER_CFG:
+        return _CACHED_VER_CFG[reg]
     app_version = await get_playstore_version()
-    lang = REGION_LANG.get(region, "ar")
+    lang = REGION_LANG.get(reg, "ar")
     api_url = (
         f"https://version.ggwhitehawk.com/live/ver.php?version={app_version}"
         f"&lang={lang}&device=android&channel=android&appstore=googleplay"
-        f"&region={region}&whitelist_version=1.3.0&whitelist_sp_version=1.0.0"
+        f"&region={reg}&whitelist_version=1.3.0&whitelist_sp_version=1.0.0"
     )
     try:
         res = await client_http.get(api_url)
@@ -481,7 +505,7 @@ async def version_config(client_http, region="ME"):
             data.get("server_url"),
         )
         if cfg[0] and cfg[2]:
-            _CACHED_VER_CFG[region] = cfg
+            _CACHED_VER_CFG[reg] = cfg
         return cfg
     except Exception:
         return None
@@ -666,36 +690,60 @@ async def send_getlogin(client_http, data, base_url, token, release_version):
         return None
 
 
-async def do_login(uid, password, region_pref="ME"):
-    async with httpx.AsyncClient(verify=False, timeout=7.0) as client_http:
+async def do_login(uid, password, region_pref="ME", token_override=None):
+    async with httpx.AsyncClient(verify=False, timeout=8.0) as client_http:
         vc = await version_config(client_http, region_pref)
         if not vc:
-            log.error("version_config failed")
+            push_log(f"version_config failed for region {region_pref}", "error")
             return None
         release_version, client_version, server_url = vc
-        tg = await get_access_token(client_http, uid, password)
-        if not tg:
-            log.error(f"access_token failed for {uid}")
-            return None
-        open_id, access_token, platform = tg
+        if token_override:
+            open_id = str(uid or "0")
+            access_token = str(token_override).strip()
+            platform = 4
+        else:
+            tg = await get_access_token(client_http, uid, password)
+            if not tg:
+                push_log(f"access_token failed for {uid}", "error")
+                return None
+            open_id, access_token, platform = tg
         payload = await build_majorlogin_payload(open_id, access_token, platform, client_version, region_pref)
         if not payload:
-            log.error("payload build failed")
+            push_log("payload build failed", "error")
             return None
         major_res = await send_majorlogin(client_http, payload, release_version, server_url)
         if not major_res or not major_res.account_uid:
-            log.error(f"MajorLogin rejected for {uid}")
+            push_log(f"MajorLogin rejected for {uid}", "error")
             return None
         gl = await send_getlogin(client_http, payload, major_res.url, major_res.token, release_version)
         if not gl:
-            log.error(f"GetLoginData failed for {uid}")
+            push_log(f"GetLoginData failed for {uid}", "error")
             return None
         res_proto, dict_res = gl
         online_addr = res_proto.Online_IP_Port or get_proto_field(dict_res, 14, "0.0.0.0:0")
         online_ip, online_port = online_addr.split(":") if ':' in online_addr else ("0.0.0.0", "0")
         chat_addr = res_proto.AccountIP_Port or get_proto_field(dict_res, 32, online_addr)
         chat_ip, chat_port = chat_addr.split(":") if ':' in chat_addr else (online_ip, online_port)
+        level_val = (
+            get_proto_field(dict_res, 6)
+            or get_proto_field(dict_res, 3)
+            or 1
+        )
+        exp_val = (
+            get_proto_field(dict_res, 7)
+            or get_proto_field(dict_res, 21)
+            or 0
+        )
+        try:
+            level_int = int(level_val)
+        except Exception:
+            level_int = 1
+        try:
+            exp_int = int(exp_val)
+        except Exception:
+            exp_int = 0
         return {
+            "auth_uid": str(uid),
             "bot_uid": str(major_res.account_uid),
             "token": major_res.token,
             "region": major_res.region or region_pref,
@@ -710,6 +758,8 @@ async def do_login(uid, password, region_pref="ME"):
             "clan_id": res_proto.Clan_ID or 0,
             "clan_data": res_proto.Clan_Compiled_Data or "",
             "server_url": major_res.url,
+            "level": level_int,
+            "exp": exp_int,
             "login_data_raw": None,
         }
 
@@ -717,12 +767,25 @@ async def do_login(uid, password, region_pref="ME"):
 class SquadBot:
     def __init__(self, login, on_close=None):
         self.login = login
+        self.auth_uid = str(login.get("auth_uid") or login["bot_uid"])
         self.uid = int(login["bot_uid"])
         self.token = login["token"]
         self.key, self.iv = login["key"], login["iv"]
         self.ts = int(login["timestamp"])
         self.region = (login.get("region") or "ME")
         self.name = login.get("account_name") or "Bot"
+        self.level = int(login.get("level") or 1)
+        self.initial_exp = int(login.get("exp") or 0)
+        self.current_exp = int(login.get("exp") or 0)
+        self.gained_exp = 0
+        self.matches_started = 0
+        self.matches_completed = 0
+        self.active_matches = 0
+        self.status = "ONLINE"
+        self.is_paused = False
+        self.connected_at = time.time()
+        self.paused_elapsed = 0.0
+        self._pause_started_at = None
         self.on_close = on_close
         self.online_r = self.online_w = None
         self.chat_r = self.chat_w = None
@@ -741,6 +804,43 @@ class SquadBot:
         t = asyncio.create_task(coro)
         self._tasks.append(t)
         return t
+
+    @property
+    def uptime_seconds(self):
+        if self.is_paused and self._pause_started_at is not None:
+            return max(0.0, self._pause_started_at - self.connected_at - self.paused_elapsed)
+        return max(0.0, time.time() - self.connected_at - self.paused_elapsed)
+
+    def pause(self):
+        if not self.is_paused:
+            self.is_paused = True
+            self._pause_started_at = time.time()
+            self.status = "PAUSED"
+
+    def resume(self):
+        if self.is_paused:
+            if self._pause_started_at is not None:
+                self.paused_elapsed += max(0.0, time.time() - self._pause_started_at)
+                self._pause_started_at = None
+            self.is_paused = False
+            if not self.closed:
+                self.status = "IN_MATCH" if self.in_team else "ONLINE"
+
+    def to_dict(self):
+        return {
+            "uid": str(self.uid),
+            "auth_uid": str(self.auth_uid),
+            "nickname": self.name,
+            "region": self.region,
+            "level": self.level,
+            "initial_exp": self.initial_exp,
+            "current_exp": self.current_exp,
+            "gained_exp": self.gained_exp,
+            "status": "PAUSED" if self.is_paused else self.status,
+            "is_paused": self.is_paused,
+            "active_matches": self.active_matches,
+            "uptime_seconds": int(self.uptime_seconds),
+        }
 
     async def connect(self):
         r = self.login
@@ -762,6 +862,7 @@ class SquadBot:
         await self.online_w.drain()
         self._spawn(self._online_read_loop())
         self._spawn(self._keepalive(self.online_w))
+        self.status = "PAUSED" if self.is_paused else "ONLINE"
 
     async def _keepalive(self, writer):
         try:
@@ -776,13 +877,20 @@ class SquadBot:
             pass
 
     async def join(self, team_code, timeout=8):
+        global matches_started_total
         self._joined.clear()
+        self.status = "SEARCHING"
         self.online_w.write(await JoinSq_original(str(team_code), self.key, self.iv))
         await self.online_w.drain()
         try:
             await asyncio.wait_for(self._joined.wait(), timeout)
+            self.matches_started += 1
+            self.active_matches = 1
+            matches_started_total += 1
+            self.status = "PAUSED" if self.is_paused else "IN_MATCH"
             return True
         except asyncio.TimeoutError:
+            self.status = "PAUSED" if self.is_paused else "ONLINE"
             return False
 
     async def _on_joined(self, f5):
@@ -797,18 +905,25 @@ class SquadBot:
             self.chat_w.write(HELLXbuild_chat_auth(self.owner_uid, str(self.chat_region_id), self.key, self.iv))
             await self.chat_w.drain()
         except Exception as e:
-            log.warning(f"chat auth failed: {e}")
+            push_log(f"chat auth failed: {e}", "warning")
 
     async def leave(self):
+        global matches_completed_total
         try:
             self.online_w.write(await ExiT(None, self.key, self.iv))
             await self.online_w.drain()
         except Exception:
             pass
+        if self.in_team:
+            self.matches_completed += 1
+            matches_completed_total += 1
+        self.active_matches = 0
         self._reset_team()
+        self.status = "PAUSED" if self.is_paused else "ONLINE"
 
     def _reset_team(self):
         self.voice_region_id = self.chat_region_id = self.owner_uid = None
+        self.active_matches = 0
         self._last_invite = None
         self._joined.clear()
 
@@ -827,7 +942,7 @@ class SquadBot:
         except asyncio.CancelledError:
             return
         except Exception as e:
-            log.warning(f"online loop: {e}")
+            push_log(f"online loop ({self.uid}): {e}", "warning")
         await self.close()
 
     async def _chat_read_loop(self):
@@ -841,7 +956,7 @@ class SquadBot:
         except asyncio.CancelledError:
             return
         except Exception as e:
-            log.warning(f"chat loop: {e}")
+            push_log(f"chat loop ({self.uid}): {e}", "warning")
 
     @staticmethod
     async def _drain_frames(buf, handler):
@@ -857,7 +972,7 @@ class SquadBot:
                     if pd:
                         await handler(pd)
                 except Exception as e:
-                    log.warning(f"packet error: {e}")
+                    push_log(f"packet error: {e}", "warning")
                 pos += 5 + length
             else:
                 pos += 1
@@ -869,15 +984,14 @@ class SquadBot:
         if not isinstance(f5, dict):
             return
         code = f5.get("8")
-        if isinstance(code, str) and "_" in code and code != self._last_invite \
-                and self.persistent and not self.in_team:
+        if isinstance(code, str) and "_" in code and code != self._last_invite                 and self.persistent and not self.in_team and not self.is_paused:
             self._last_invite = code
             try:
                 owner = int(f5.get("1", self.uid))
                 self.online_w.write(await MahirAccepted(owner, code, self.key, self.iv, self.region))
                 await self.online_w.drain()
             except Exception as e:
-                log.warning(f"accept invite failed: {e}")
+                push_log(f"accept invite failed: {e}", "warning")
         if not self.voice_region_id and f5.get("17"):
             await self._on_joined(f5)
 
@@ -885,6 +999,8 @@ class SquadBot:
         return
 
     async def say(self, message):
+        if self.is_paused:
+            return
         if not self.chat_w or self.chat_w.transport.is_closing():
             return
         try:
@@ -895,12 +1011,13 @@ class SquadBot:
             self.chat_w.write(pkt)
             await self.chat_w.drain()
         except Exception as e:
-            log.warning(f"send failed: {e}")
+            push_log(f"send failed ({self.uid}): {e}", "warning")
 
     async def close(self):
         if self.closed:
             return
         self.closed = True
+        self.status = "PAUSED" if self.is_paused else "OFFLINE"
         self._reset_team()
         for w in (self.online_w, self.chat_w):
             if w:
@@ -935,8 +1052,8 @@ class AsyncLoop:
         asyncio.set_event_loop(self.loop)
         self.loop.run_forever()
 
-    def run(self, coro):
-        return asyncio.run_coroutine_threadsafe(coro, self.loop).result()
+    def run(self, coro, timeout=25):
+        return asyncio.run_coroutine_threadsafe(coro, self.loop).result(timeout=timeout)
 
     def start_background(self, coro):
         return asyncio.run_coroutine_threadsafe(coro, self.loop)
@@ -945,27 +1062,100 @@ class AsyncLoop:
 async_loop = AsyncLoop()
 
 
+def _accs_file_path():
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    for candidate in ("accs.txt", os.path.join(base_dir, "accs.txt")):
+        if os.path.exists(candidate):
+            return candidate
+    return os.path.join(base_dir, "accs.txt")
+
+
+def append_account_to_file(uid, password):
+    path = _accs_file_path()
+    line = f"{str(uid).strip()}:{str(password).strip()}\n"
+    existing = []
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            existing = [l.strip() for l in f if l.strip()]
+    uid_prefix = f"{str(uid).strip()}:"
+    if not any(l.startswith(uid_prefix) for l in existing):
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line)
+
+
+def remove_account_from_file(uid, auth_uid=""):
+    path = _accs_file_path()
+    if not os.path.exists(path):
+        return
+    targets = {str(uid).strip()}
+    if auth_uid:
+        targets.add(str(auth_uid).strip())
+    with open(path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+    kept = []
+    for l in lines:
+        s = l.strip()
+        if not s or ":" not in s:
+            kept.append(l)
+            continue
+        left = s.split(":", 1)[0].strip()
+        if left not in targets:
+            kept.append(l)
+    with open(path, "w", encoding="utf-8") as f:
+        f.writelines(kept)
+
+
 class AccountPool:
     def __init__(self, concurrency=12):
         self.accounts = []
+        self.credentials = {}
         self.lock = asyncio.Lock()
         self.current_index = 0
         self.loading = False
         self.loaded = False
         self.concurrency = concurrency
 
+    async def connect_single(self, uid, password, region="ME", token_override=None, persist=True):
+        uid_s = str(uid).strip()
+        pass_s = str(password or "").strip()
+        reg_s = (region or "ME").upper()
+        if persist and uid_s and pass_s and not token_override:
+            self.credentials[uid_s] = (pass_s, reg_s)
+            append_account_to_file(uid_s, pass_s)
+
+        login = await do_login(uid_s, pass_s, reg_s, token_override=token_override)
+        if not login:
+            return None
+
+        bot = SquadBot(login)
+        bot.is_paused = all_paused_flag
+        if bot.is_paused:
+            bot.status = "PAUSED"
+        await bot.connect()
+        bot.persistent = True
+        self.credentials[str(bot.uid)] = (pass_s, reg_s)
+        self.credentials[uid_s] = (pass_s, reg_s)
+
+        async with self.lock:
+            self.accounts = [a for a in self.accounts if a.uid != bot.uid and str(a.auth_uid) != uid_s]
+            self.accounts.append(bot)
+
+        push_log(f"Account {uid_s} ({bot.name}) connected successfully", "success")
+        return bot
+
     async def load_and_connect(self):
         if self.loading or self.loaded:
             return
         self.loading = True
-        if not os.path.exists("accs.txt"):
-            log.warning("accs.txt not found")
+        path = _accs_file_path()
+        if not os.path.exists(path):
+            push_log("accs.txt not found", "warning")
             self.loading = False
             self.loaded = True
             return
-        with open("accs.txt", "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             lines = [l.strip() for l in f if ":" in l]
-        print(f"LOADED {len(lines)} ACCOUNTS FROM accs.txt")
+        push_log(f"Loaded {len(lines)} accounts from accs.txt", "info")
 
         sem = asyncio.Semaphore(self.concurrency)
 
@@ -974,17 +1164,9 @@ class AccountPool:
                 uid, password = line.split(":", 1)
                 uid, password = uid.strip(), password.strip()
                 try:
-                    login = await do_login(uid, password, "ME")
-                    if not login:
-                        return
-                    bot = SquadBot(login)
-                    await bot.connect()
-                    bot.persistent = True
-                    async with self.lock:
-                        self.accounts.append(bot)
-                    print(f"ACCOUNT {uid} CONNECTED SUCCESFULLY .")
+                    await self.connect_single(uid, password, "ME", persist=False)
                 except Exception as e:
-                    log.error(f"account {uid} error: {e}")
+                    push_log(f"Account {uid} error: {e}", "error")
 
         await asyncio.gather(*[_worker(line) for line in lines], return_exceptions=True)
         self.loading = False
@@ -992,10 +1174,11 @@ class AccountPool:
 
     async def get_next_bot(self):
         async with self.lock:
-            if not self.accounts:
+            active = [a for a in self.accounts if not a.closed and not a.is_paused]
+            if not active:
                 return None
-            bot = self.accounts[self.current_index]
-            self.current_index = (self.current_index + 1) % len(self.accounts)
+            bot = active[self.current_index % len(active)]
+            self.current_index = (self.current_index + 1) % len(active)
             return bot
 
     async def wait_for_account(self, timeout=12):
@@ -1009,6 +1192,80 @@ class AccountPool:
             await asyncio.sleep(0.5)
         return await self.get_next_bot()
 
+    async def find_bot(self, uid):
+        u = str(uid).strip()
+        async with self.lock:
+            for a in self.accounts:
+                if str(a.uid) == u or str(a.auth_uid) == u:
+                    return a
+        return None
+
+    async def remove_bot(self, uid, auth_uid=""):
+        targets = {str(uid).strip()}
+        if auth_uid:
+            targets.add(str(auth_uid).strip())
+        to_close = []
+        async with self.lock:
+            kept = []
+            for a in self.accounts:
+                if str(a.uid) in targets or str(a.auth_uid) in targets:
+                    to_close.append(a)
+                else:
+                    kept.append(a)
+            self.accounts = kept
+        for k in targets:
+            self.credentials.pop(k, None)
+        remove_account_from_file(uid, auth_uid)
+        for b in to_close:
+            await b.close()
+        push_log(f"Removed account {uid}", "warning")
+
+    async def refresh_bot(self, uid):
+        bot = await self.find_bot(uid)
+        if not bot:
+            return False, "Account not found"
+        cred = self.credentials.get(str(bot.uid)) or self.credentials.get(str(bot.auth_uid))
+        if not cred:
+            return False, "No saved credentials for refresh"
+        pw, reg = cred
+        await bot.close()
+        reconnected = await self.connect_single(bot.auth_uid, pw, reg, persist=False)
+        return (True, "Refreshed") if reconnected else (False, "Reconnect failed")
+
+    async def restart_bot(self, uid):
+        return await self.refresh_bot(uid)
+
+    async def toggle_pause_bot(self, uid):
+        bot = await self.find_bot(uid)
+        if not bot:
+            return False, False, "Account not found"
+        if bot.is_paused:
+            bot.resume()
+            push_log(f"Resumed account {bot.uid}", "info")
+            return True, False, "Resumed"
+        bot.pause()
+        push_log(f"Paused account {bot.uid}", "info")
+        return True, True, "Paused"
+
+    async def toggle_pause_all(self):
+        global all_paused_flag
+        async with self.lock:
+            if not self.accounts:
+                all_paused_flag = not all_paused_flag
+                return all_paused_flag
+            any_active = any(not a.is_paused for a in self.accounts)
+            if any_active:
+                for a in self.accounts:
+                    a.pause()
+                all_paused_flag = True
+                push_log("All accounts paused", "warning")
+            else:
+                for a in self.accounts:
+                    a.resume()
+                all_paused_flag = False
+                push_log("All accounts resumed", "success")
+            return all_paused_flag
+
 
 account_pool = AccountPool(concurrency=12)
 spam_tasks = {}
@@ -1018,12 +1275,13 @@ async def _spam_loop(bot, team_code, text, interval=1.1):
     key = str(team_code)
     try:
         while not bot.closed and bot.in_team:
-            await bot.say(text)
+            if not bot.is_paused:
+                await bot.say(text)
             await asyncio.sleep(interval)
     except asyncio.CancelledError:
         pass
     except Exception as e:
-        log.warning(f"spam loop error ({key}): {e}")
+        push_log(f"spam loop error ({key}): {e}", "warning")
     finally:
         if spam_tasks.get(key) is asyncio.current_task():
             spam_tasks.pop(key, None)
@@ -1044,7 +1302,7 @@ async def run_tmc_spam(team_code, text, interval=1.1):
         if not joined:
             return False, "Failed to join team"
         await asyncio.sleep(0.5)
-        print(f"SUCCESS JOINED TO {team_code}")
+        push_log(f"Success joined team {team_code}", "match")
 
     old_task = spam_tasks.get(team_code)
     if old_task and not old_task.done():
@@ -1053,6 +1311,18 @@ async def run_tmc_spam(team_code, text, interval=1.1):
     task = asyncio.create_task(_spam_loop(bot, team_code, text, interval=interval))
     spam_tasks[team_code] = task
     return True, "Joined and started spamming"
+
+
+async def _create_team_worker(region, clan_id, count, password):
+    push_log(f"Creating {count} guest bots in region {region} (Clan: {clan_id})...", "info")
+    created = 0
+    for _ in range(count):
+        guest_uid = str(random.randint(3000000000, 4999999999))
+        bot = await account_pool.connect_single(guest_uid, password, region, persist=True)
+        if bot:
+            created += 1
+        await asyncio.sleep(0.4)
+    push_log(f"Team creation finished: {created}/{count} bots connected in {region}", "success" if created else "warning")
 
 
 app = Flask(__name__)
@@ -1107,6 +1377,122 @@ def status():
         "stop_usage": "/stop_spam?tmc=TEAM_CODE",
         "DEV": DEV_NAME
     }), 200
+
+
+@app.route("/api/stats", methods=["GET"])
+def api_stats():
+    accs = [a.to_dict() for a in account_pool.accounts]
+    total_gained = sum(int(a.get("gained_exp") or 0) for a in accs)
+    total_started = matches_started_total or sum(int(a.matches_started or 0) for a in account_pool.accounts)
+    total_done = matches_completed_total or sum(int(a.matches_completed or 0) for a in account_pool.accounts)
+    total_active = sum(int(a.get("active_matches") or 0) for a in accs)
+    uptime_sec = max(1.0, time.time() - START_TIME)
+    exp_per_hour = int(round((total_gained / uptime_sec) * 3600))
+    with ui_logs_lock:
+        logs_copy = list(ui_logs)
+    return jsonify({
+        "ok": True,
+        "total_accounts": len(accs),
+        "total_matches_started": total_started,
+        "total_matches": total_done,
+        "total_gained_exp": total_gained,
+        "total_active_matches": total_active,
+        "exp_per_hour": exp_per_hour,
+        "uptime": int(uptime_sec),
+        "accounts": accs,
+        "logs": logs_copy,
+        "DEV": DEV_NAME,
+    }), 200
+
+
+@app.route("/api/account/add", methods=["POST"])
+def api_account_add():
+    body = request.get_json(silent=True) or {}
+    token = str(body.get("token") or "").strip()
+    uid = str(body.get("uid") or "").strip()
+    password = str(body.get("password") or "").strip()
+    region = str(body.get("region") or "ME").upper().strip()
+
+    if token:
+        acc_id = uid or str(random.randint(1000000000, 9999999999))
+        bot = async_loop.run(account_pool.connect_single(acc_id, "", region, token_override=token, persist=False))
+    else:
+        if not uid or not password:
+            return jsonify({"status": "error", "error": "UID and password are required"}), 400
+        bot = async_loop.run(account_pool.connect_single(uid, password, region, persist=True))
+
+    if not bot:
+        return jsonify({"status": "error", "error": "Failed to login or connect account"}), 400
+    return jsonify({"status": "ok", "uid": str(bot.uid), "nickname": bot.name}), 200
+
+
+@app.route("/api/account/delete", methods=["POST"])
+def api_account_delete():
+    body = request.get_json(silent=True) or {}
+    uid = str(body.get("uid") or "").strip()
+    auth_uid = str(body.get("auth_uid") or "").strip()
+    if not uid and not auth_uid:
+        return jsonify({"status": "error", "error": "UID required"}), 400
+    async_loop.run(account_pool.remove_bot(uid, auth_uid))
+    return jsonify({"status": "ok"}), 200
+
+
+@app.route("/api/account/refresh", methods=["POST"])
+def api_account_refresh():
+    body = request.get_json(silent=True) or {}
+    uid = str(body.get("uid") or "").strip()
+    if not uid:
+        return jsonify({"status": "error", "error": "UID required"}), 400
+    ok, msg = async_loop.run(account_pool.refresh_bot(uid))
+    return jsonify({"status": "ok" if ok else "error", "message": msg, "error": None if ok else msg}), (200 if ok else 400)
+
+
+@app.route("/api/account/restart", methods=["POST"])
+def api_account_restart():
+    body = request.get_json(silent=True) or {}
+    uid = str(body.get("uid") or "").strip()
+    if not uid:
+        return jsonify({"status": "error", "error": "UID required"}), 400
+    ok, msg = async_loop.run(account_pool.restart_bot(uid))
+    return jsonify({"status": "ok" if ok else "error", "message": msg, "error": None if ok else msg}), (200 if ok else 400)
+
+
+@app.route("/api/account/pause", methods=["POST"])
+def api_account_pause():
+    body = request.get_json(silent=True) or {}
+    uid = str(body.get("uid") or "").strip()
+    if not uid:
+        return jsonify({"status": "error", "error": "UID required"}), 400
+    ok, is_paused, msg = async_loop.run(account_pool.toggle_pause_bot(uid))
+    if not ok:
+        return jsonify({"status": "error", "error": msg}), 404
+    return jsonify({"status": "ok", "is_paused": is_paused, "message": msg}), 200
+
+
+@app.route("/api/account/pause_all", methods=["POST"])
+def api_account_pause_all():
+    all_p = async_loop.run(account_pool.toggle_pause_all())
+    return jsonify({"status": "ok", "all_paused": all_p}), 200
+
+
+@app.route("/api/create_team", methods=["POST"])
+def api_create_team():
+    body = request.get_json(silent=True) or {}
+    region = str(body.get("region") or "ME").upper().strip()
+    clan_id = str(body.get("clan_id") or "").strip()
+    count = max(1, min(10, int(body.get("count") or 4)))
+    password = str(body.get("password") or "RAFIN TxT").strip() or "RAFIN TxT"
+    if not clan_id:
+        return jsonify({"ok": False, "error": "Clan ID is required"}), 400
+    async_loop.start_background(_create_team_worker(region, clan_id, count, password))
+    return jsonify({"ok": True, "region": region, "clan_id": clan_id, "count": count}), 200
+
+
+@app.route("/api/logs/clear", methods=["POST"])
+def api_logs_clear():
+    with ui_logs_lock:
+        ui_logs.clear()
+    return jsonify({"ok": True}), 200
 
 
 @app.route("/tmc", methods=["GET", "POST"])
