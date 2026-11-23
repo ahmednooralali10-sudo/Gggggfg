@@ -66,7 +66,7 @@ DEFAULT_HEADERS = {
     'ReleaseVersion': 'OB55',
 }
 
-# ==================== LEVEL-UP & MATCH CONSTANTS (EXTRACTED) ====================
+# ==================== LEVEL-UP & MATCH CONSTANTS ====================
 TOKEN_CACHE_FILE = "token_cache.json"
 DEVICES_FILE = "devices.json"
 TOKEN_CACHE_TTL = 1200
@@ -130,7 +130,7 @@ def push_log(message, level="info"):
         log.info(message)
 
 
-# ==================== PERSISTENT DEVICE & TOKEN CACHE (EXTRACTED) ====================
+# ==================== PERSISTENT DEVICE & TOKEN CACHE ====================
 def get_device_for_account(account_identifier: str) -> dict:
     devices = {}
     if os.path.exists(DEVICES_FILE):
@@ -261,7 +261,7 @@ def cache_invalidate(uid: str):
         _save_token_cache(cache)
 
 
-# ==================== DNS & SOCKET OPTIMIZERS (EXTRACTED) ====================
+# ==================== DNS & SOCKET OPTIMIZERS ====================
 async def resolve_host_cloudflare(hostname: str) -> str:
     if not hostname:
         return hostname
@@ -280,7 +280,7 @@ async def resolve_host_cloudflare(hostname: str) -> str:
         try:
             tx_id = random.randint(1000, 65535)
             header = struct.pack(">HHHHHH", tx_id, 0x0100, 1, 0, 0, 0)
-            qname = b"".join(bytes([len(part)]) + part.encode('ascii') for part in hostname.split('.')) + b"\x00"
+            qname = b"".join(bytes([len(part)]) + part.encode('ascii') for part in hostname.split('.')) + b""
             query_pkt = header + qname + struct.pack(">HH", 1, 1)
 
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -358,7 +358,7 @@ def optimize_udp_socket(sock: socket.socket):
         pass
 
 
-# ==================== LEVEL-UP UDP / TEA / CRC7 HELPERS (EXTRACTED) ====================
+# ==================== PACKET & CRYPTO HELPERS ====================
 async def has_ssan_zig(n):
     z = (n << 1) & 0xFFFFFFFFFFFFFFFF
     out = bytearray()
@@ -458,7 +458,7 @@ async def tea_cbc_decrypt(body, key_bytes):
 
 async def build_padded(content):
     pad_len = (8 - (len(content) + 10) % 8) % 8
-    return bytes([pad_len, 0, 0]) + b"\x00" * pad_len + content + b"\x00" * 7
+    return bytes([pad_len, 0, 0]) + b"" * pad_len + content + b"" * 7
 
 
 async def encode_header(layout, send_option, cmd, order_id, flags, length, k, v80):
@@ -558,7 +558,7 @@ async def build_hello_packet(text, key, layout):
     data = text.encode("utf-8")
     if len(data) > 25:
         raise ValueError(f"Text is too long ({len(data)} bytes)")
-    content = b"\x10\x00\x00\x00" + data + b"\x00" * (29 - 4 - len(data))
+    content = b"" + data + b"" * (29 - 4 - len(data))
     k, v80 = await produce_xor_key(key)
     layout = await parse_layout(layout)
     padded = await build_padded(content)
@@ -614,18 +614,18 @@ async def reply_for(frame, key, mask, ack_key=0x68, ping_key=0x6D, hello_key=0x5
     typ = await classify(frame)
     if typ == "HELLO":
         if ack_style == "echo":
-            content = frame["content"] if frame["content"] else b"\x10\x00\x00\x00"
+            content = frame["content"] if frame["content"] else b""
             return typ, await build_packet(hello_key, nr, 1, 1, None, 1, content, key)
-        return typ, await build_packet(ack_key, nr, 0, 2, None, 1, b"\x01\x00", key)
+        return typ, await build_packet(ack_key, nr, 0, 2, None, 1, b"", key)
     if typ == "ACK":
-        content = frame["content"] if frame["content"] else b"\x01\x00"
+        content = frame["content"] if frame["content"] else b""
         return typ, await build_packet(ack_key, nr, 0, 2, None, 1, content, key)
     if typ == "PING":
         c = frame["content"]
         counter = c[:4] if len(c) >= 4 else c
-        return typ, await build_packet(ping_key, nr, 0, 3, None, 0, counter + b"\x00\x00\x00", key, encrypted=False)
+        return typ, await build_packet(ping_key, nr, 0, 3, None, 0, counter + b"", key, encrypted=False)
     if typ == "JOIN_MATCH":
-        return typ, await build_packet(ack_key, nr, 0, 2, None, 1, b"\x02\x00", key)
+        return typ, await build_packet(ack_key, nr, 0, 2, None, 1, b"", key)
     return typ, None
 
 
@@ -637,7 +637,7 @@ async def keepalive_ping(sock, ip, port, key_bytes, mask, stop_event):
     while not stop_event.is_set():
         pk = ping_keys[i % len(ping_keys)]
         counter = int(time.time() * 1000) & 0xFFFFFFFF
-        pkt = await build_packet(pk, nr, 0, 3, None, 0, struct.pack("<I", counter) + b"\x00\x00\x00", key_bytes, encrypted=False)
+        pkt = await build_packet(pk, nr, 0, 3, None, 0, struct.pack("<I", counter) + b"", key_bytes, encrypted=False)
         try:
             await loop.sock_sendto(sock, pkt, (ip, port))
         except Exception:
@@ -729,7 +729,13 @@ async def aes_encrypt(payload, key, iv):
     return AES.new(key, AES.MODE_CBC, iv).encrypt(pad(payload, AES.block_size))
 
 
-# ==================== LOGIN FUNCTIONS (PRESERVED UNCHANGED) ====================
+def build_ob55_online_auth(account_uid, token, kts, key, iv):
+    enc_token = AES.new(key, AES.MODE_CBC, iv).encrypt(pad(token.encode("utf-8"), 16))
+    return (bytes.fromhex("830c") + int(account_uid).to_bytes(8, "big") +
+            int(kts).to_bytes(4, "big") + len(enc_token).to_bytes(8, "big") + enc_token, enc_token)
+
+
+# ==================== WORKING LOGIN FUNCTIONS (FROM WORKING OB55 CODE) ====================
 def _pb_varint(n):
     if n < 0:
         n = (1 << 64) + n
@@ -820,7 +826,7 @@ async def version_config(client_http, region="ME"):
     if reg in _CACHED_VER_CFG:
         return _CACHED_VER_CFG[reg]
     app_version = await get_playstore_version()
-    lang = REGION_LANG.get(reg, "ar")
+    lang = REGION_LANG.get(reg, "hi")
     api_url = (
         f"https://version.ggwhitehawk.com/live/ver.php?version={app_version}"
         f"&lang={lang}&device=android&channel=android&appstore=googleplay"
@@ -830,11 +836,11 @@ async def version_config(client_http, region="ME"):
         res = await client_http.get(api_url)
         data = res.json()
         cfg = (
-            data.get("latest_release_version"),
-            data.get("remote_version"),
+            data.get("latest_release_version") or DEFAULT_HEADERS["ReleaseVersion"],
+            data.get("remote_version") or app_version,
             data.get("server_url"),
         )
-        if cfg[0] and cfg[2]:
+        if cfg[2]:
             _CACHED_VER_CFG[reg] = cfg
         return cfg
     except Exception:
@@ -858,15 +864,18 @@ async def get_access_token(client_http, uid, password):
         "client_secret": "2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3",
         "client_id": "100067",
     }
-    for _ in range(2):
+    for _ in range(3):
         try:
             r = await client_http.post(url, headers=hdrs, data=data)
             if r.status_code == 200:
                 rd = r.json()
-                return rd.get("open_id"), rd.get("access_token"), rd.get("platform", 4)
+                open_id = rd.get("open_id")
+                access_token = rd.get("access_token")
+                if open_id and access_token:
+                    return open_id, access_token, rd.get("platform", 4)
         except Exception:
             pass
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.4)
     return None
 
 
@@ -1021,12 +1030,15 @@ async def send_getlogin(client_http, data, base_url, token, release_version):
 
 
 async def do_login(uid, password, region_pref="ME", token_override=None):
-    async with httpx.AsyncClient(verify=False, timeout=8.0) as client_http:
+    async with httpx.AsyncClient(verify=False, timeout=15.0) as client_http:
         vc = await version_config(client_http, region_pref)
         if not vc:
             push_log(f"version_config failed for region {region_pref}", "error")
             return None
         release_version, client_version, server_url = vc
+        if not server_url:
+            push_log(f"version_config returned no server_url for {region_pref}", "error")
+            return None
         if token_override:
             open_id = str(uid or "0")
             access_token = str(token_override).strip()
@@ -1037,7 +1049,9 @@ async def do_login(uid, password, region_pref="ME", token_override=None):
                 push_log(f"access_token failed for {uid}", "error")
                 return None
             open_id, access_token, platform = tg
-        payload = await build_majorlogin_payload(open_id, access_token, platform, client_version, region_pref)
+        payload = await build_majorlogin_payload(
+            open_id, access_token, platform, client_version or "1.134.21", region_pref
+        )
         if not payload:
             push_log("payload build failed", "error")
             return None
@@ -1054,16 +1068,8 @@ async def do_login(uid, password, region_pref="ME", token_override=None):
         online_ip, online_port = online_addr.split(":") if ':' in online_addr else ("0.0.0.0", "0")
         chat_addr = res_proto.AccountIP_Port or get_proto_field(dict_res, 32, online_addr)
         chat_ip, chat_port = chat_addr.split(":") if ':' in chat_addr else (online_ip, online_port)
-        level_val = (
-            get_proto_field(dict_res, 6)
-            or get_proto_field(dict_res, 3)
-            or 1
-        )
-        exp_val = (
-            get_proto_field(dict_res, 7)
-            or get_proto_field(dict_res, 21)
-            or 0
-        )
+        level_val = get_proto_field(dict_res, 6) or get_proto_field(dict_res, 3) or 1
+        exp_val = get_proto_field(dict_res, 7) or get_proto_field(dict_res, 21) or 0
         try:
             level_int = int(level_val)
         except Exception:
@@ -1099,7 +1105,7 @@ async def do_login(uid, password, region_pref="ME", token_override=None):
         return result_dict
 
 
-# ==================== LEVEL-UP UDP MATCH & LONE WOLF ENGINE (EXTRACTED) ====================
+# ==================== LEVEL-UP UDP MATCH & LONE WOLF ENGINE ====================
 async def start_game_lone_wolf(region, client_version, writer, key, iv):
     raw_pkt = bytes.fromhex(
         "080112800a0a010b102b3a110a044944433110aa011a064555524f50453a100a044944433210311a064555524f504540014a0801090a0b1219202758016291090a8001303838463832424630324139363736373032303130313030303030303030303030303136303030313030313530303032323246393745454530463030303030303436373632353134303030303030303030303030303030303030303030303030303030303030303030303030303066663030303030303030636163666131366410241afb02735d5e571400024a775d45414d1a041b1c001f11010449715f4243481a001e1d071c1703004b1a4066785c524570735c51486775421b5c5a4c07504042685a63610816054e19025e75196001477c015165406370195f5547404e4550640103020f1304064863754268676c755f65576e40467e5f0a417a4701026d675d6e73670b1108495a4c6a0b78470b740065645e525a057258425f584a447d4e6759440c11044e7c596d7f4b625f7d04055a47505c4e1d6b5b4107447d7201057d7f0f14084e430457674f7e517d72015172415d027473577c4d615f79535256780911030f4d5e027a797f614165067806505d53777750475e75064257076500460817014e741e7e5078487e7a7c465e7669767153497064605a7376677773550d160148037e18675966787f4c42607a645f577e7b441b460776026b18685d0b110205490060020f70676175654674706671797f41067346677c4e06585e780f15074c57047b40517075415f6364027259674b5b0166407f7340600407770a22047a5d5c52300b3a0a167305067162727516134208312e3133302e3232480350015ae90403626253513635686e556f4e36416456324b796f566c636f477776484f624e56526c4d727073504b4f43654177616848494176795556497273743752737149734a7a786b3247525268377a2f637664626d504f6a73552f79626d38547a4c69586d2f474351696d494b53486833447955726f39515152756c34545350626d6d624b7949565937545671577059455372323646572f59624578507338514f706d317372785455736c30796a434144444d4f34616a654b615753366361496c554b4963797a494e396d52516f715277687939797257476d337a644345337a6a61436f492f5a585233656f65365a42647a64677654636b6b665733356e4d4c6a6a565072564b6433523172756174394e50514150724a5546627859696c4c5a3859707336654d5447666b6649793574666a526c314d4648706b51774c6373374439656378566c41636f374e664f6d2b30654756466c4434744478706771385533595973587645384842502f70666c767a737138316a32524f4d7857437556445442492f684735625462773166456e4249725162762b636144775147696f74554e316d4c4b77734379456f4766706746614251457645672b736a764c4c78704743334c304a5344532f74526169504354553344374e6249306547516651622f5a466f4c36455630775a324d6f583932414c572f5049752f56634663584e70596b356f7966326151416a536971486a2f363276354843644f525551303578754e6171795251625653704654303137655237675255636b4966366c6f447476342b514e4a4670766d74757077707774396a5a5974437a4b56743657726d6e36785837706658456251555434684f3758a201050803108703a201050804108103a20105080510c001a20105081d10cc01a2010408161078a20105080e10af01a201020815"
@@ -1290,7 +1296,6 @@ async def play_game(bot_ref, server_ip_port, thunder, sharma, udp_key, match_cod
         if completed_cleanly:
             bot_ref.matches_completed += 1
             matches_completed_total += 1
-            # Estimate / record level-up EXP gain per completed Lone Wolf match
             exp_gain = 100
             bot_ref.gained_exp += exp_gain
             bot_ref.current_exp += exp_gain
@@ -1311,7 +1316,7 @@ async def play_game(bot_ref, server_ip_port, thunder, sharma, udp_key, match_cod
             bot_ref.status = "PAUSED" if bot_ref.is_paused else ("IN_MATCH" if bot_ref.active_matches > 0 else "ONLINE")
 
 
-# ==================== LEVEL-UP BOT WORKER (REPLACING SQUAD LOGIC) ====================
+# ==================== LEVEL-UP BOT WORKER ====================
 class LevelUpBot:
     def __init__(self, login, on_close=None):
         global matches_started_total
@@ -1396,7 +1401,7 @@ class LevelUpBot:
         r = self.login
         resolved_ip = await resolve_host_cloudflare(r["online_ip"])
         self.online_r, self.online_w = await asyncio.wait_for(
-            asyncio.open_connection(resolved_ip, int(r["online_port"])), 8
+            asyncio.open_connection(resolved_ip, int(r["online_port"])), 10
         )
         raw_sock = self.online_w.get_extra_info('socket')
         if raw_sock:
@@ -1584,7 +1589,7 @@ class AsyncLoop:
         asyncio.set_event_loop(self.loop)
         self.loop.run_forever()
 
-    def run(self, coro, timeout=25):
+    def run(self, coro, timeout=30):
         return asyncio.run_coroutine_threadsafe(coro, self.loop).result(timeout=timeout)
 
     def start_background(self, coro):
@@ -1971,33 +1976,25 @@ def api_create_team():
     if not clan_id:
         return jsonify({"ok": False, "error": "Clan ID is required"}), 400
     async_loop.start_background(_create_levelup_accounts_worker(region, clan_id, count, password))
-    return jsonify({"ok": True, "region": region, "clan_id": clan_id, "count": count}), 200
+    return jsonify({"ok": True, "message": f"Started creating {count} accounts in {region}"}), 200
 
 
-@app.route("/api/logs/clear", methods=["POST"])
-def api_logs_clear():
-    with ui_logs_lock:
-        ui_logs.clear()
-    return jsonify({"ok": True}), 200
-
-
-@app.route("/api/levelup/start", methods=["GET", "POST"])
+@app.route("/api/levelup/start", methods=["POST"])
 def api_levelup_start():
     body = request.get_json(silent=True) or {}
-    region = str(body.get("region") or request.args.get("region") or "BD").upper().strip()
-    res = async_loop.run(levelup_manager.start_levelup_all(region=region), timeout=25)
-    res["DEV"] = DEV_NAME
+    region = str(body.get("region") or "BD").upper().strip()
+    res = async_loop.run(levelup_manager.start_levelup_all(region=region))
     return jsonify(res), (200 if res.get("ok") else 400)
 
 
-@app.route("/api/levelup/auto", methods=["POST"])
-def api_levelup_auto():
+@app.route("/api/levelup/toggle", methods=["POST"])
+def api_levelup_toggle():
     body = request.get_json(silent=True) or {}
-    enabled = body.get("enabled") if "enabled" in body else None
-    state = async_loop.run(levelup_manager.toggle_auto(enabled=enabled), timeout=10)
-    return jsonify({"ok": True, "auto_levelup_enabled": state, "DEV": DEV_NAME}), 200
+    enabled = body.get("enabled")
+    state = async_loop.run(levelup_manager.toggle_auto(enabled=enabled))
+    return jsonify({"ok": True, "auto_levelup_enabled": state}), 200
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
+    port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, threaded=True)
