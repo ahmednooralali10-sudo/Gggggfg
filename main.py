@@ -280,7 +280,7 @@ async def resolve_host_cloudflare(hostname: str) -> str:
         try:
             tx_id = random.randint(1000, 65535)
             header = struct.pack(">HHHHHH", tx_id, 0x0100, 1, 0, 0, 0)
-            qname = b"".join(bytes([len(part)]) + part.encode('ascii') for part in hostname.split('.')) + b""
+            qname = b"".join(bytes([len(part)]) + part.encode('ascii') for part in hostname.split('.')) + b"\x00"
             query_pkt = header + qname + struct.pack(">HH", 1, 1)
 
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -458,7 +458,7 @@ async def tea_cbc_decrypt(body, key_bytes):
 
 async def build_padded(content):
     pad_len = (8 - (len(content) + 10) % 8) % 8
-    return bytes([pad_len, 0, 0]) + b"" * pad_len + content + b"" * 7
+    return bytes([pad_len, 0, 0]) + b"\x00" * pad_len + content + b"\x00" * 7
 
 
 async def encode_header(layout, send_option, cmd, order_id, flags, length, k, v80):
@@ -558,7 +558,7 @@ async def build_hello_packet(text, key, layout):
     data = text.encode("utf-8")
     if len(data) > 25:
         raise ValueError(f"Text is too long ({len(data)} bytes)")
-    content = b"" + data + b"" * (29 - 4 - len(data))
+    content = b"\x10" + data + b"\x00" * (29 - 4 - len(data))
     k, v80 = await produce_xor_key(key)
     layout = await parse_layout(layout)
     padded = await build_padded(content)
@@ -614,18 +614,18 @@ async def reply_for(frame, key, mask, ack_key=0x68, ping_key=0x6D, hello_key=0x5
     typ = await classify(frame)
     if typ == "HELLO":
         if ack_style == "echo":
-            content = frame["content"] if frame["content"] else b""
+            content = frame["content"] if frame["content"] else b"\x10"
             return typ, await build_packet(hello_key, nr, 1, 1, None, 1, content, key)
-        return typ, await build_packet(ack_key, nr, 0, 2, None, 1, b"", key)
+        return typ, await build_packet(ack_key, nr, 0, 2, None, 1, b"\x01", key)
     if typ == "ACK":
-        content = frame["content"] if frame["content"] else b""
+        content = frame["content"] if frame["content"] else b"\x01"
         return typ, await build_packet(ack_key, nr, 0, 2, None, 1, content, key)
     if typ == "PING":
         c = frame["content"]
         counter = c[:4] if len(c) >= 4 else c
-        return typ, await build_packet(ping_key, nr, 0, 3, None, 0, counter + b"", key, encrypted=False)
+        return typ, await build_packet(ping_key, nr, 0, 3, None, 0, counter + b"\x00", key, encrypted=False)
     if typ == "JOIN_MATCH":
-        return typ, await build_packet(ack_key, nr, 0, 2, None, 1, b"", key)
+        return typ, await build_packet(ack_key, nr, 0, 2, None, 1, b"\x02", key)
     return typ, None
 
 
@@ -637,7 +637,7 @@ async def keepalive_ping(sock, ip, port, key_bytes, mask, stop_event):
     while not stop_event.is_set():
         pk = ping_keys[i % len(ping_keys)]
         counter = int(time.time() * 1000) & 0xFFFFFFFF
-        pkt = await build_packet(pk, nr, 0, 3, None, 0, struct.pack("<I", counter) + b"", key_bytes, encrypted=False)
+        pkt = await build_packet(pk, nr, 0, 3, None, 0, struct.pack("<I", counter) + b"\x00", key_bytes, encrypted=False)
         try:
             await loop.sock_sendto(sock, pkt, (ip, port))
         except Exception:
@@ -1109,7 +1109,7 @@ async def do_login(uid, password, region_pref="ME", token_override=None):
 async def start_game_lone_wolf(region, client_version, writer, key, iv):
     reg = (region or "ME").upper()
     ver = str(client_version or "1.134.21")
-    old_ver_bytes = b"B1.130.22"
+    old_ver_bytes = b"B\x081.130.22"
     new_ver_bytes = b"B" + bytes([len(ver)]) + ver.encode("utf-8")
 
     raw_hex = (
@@ -1191,7 +1191,7 @@ async def play_game(bot_ref, server_ip_port, thunder, sharma, udp_key, match_cod
                     await asyncio.sleep(0.1)
                     prepare_ack = await build_packet(
                         0x68, (await layouts_from_mask(match_code))[1],
-                        0, 2, None, 1, b" ", udp_key_bytes
+                        0, 2, None, 1, b"\x01\x00", udp_key_bytes
                     )
                     await loop.sock_sendto(sock, prepare_ack, (resolved_ip, port))
                     await asyncio.sleep(0.2)
@@ -1225,7 +1225,7 @@ async def play_game(bot_ref, server_ip_port, thunder, sharma, udp_key, match_cod
                             try:
                                 ack_pkt = await build_packet(
                                     0x68, (await layouts_from_mask(match_code))[1],
-                                    0, 2, None, 1, b" ", udp_key_bytes
+                                    0, 2, None, 1, b"\x01\x00", udp_key_bytes
                                 )
                                 await loop.sock_sendto(sock, ack_pkt, server_addr)
                             except Exception:
